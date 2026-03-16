@@ -1,6 +1,6 @@
 # YouTube Custom Queue
 
-A Greasemonkey/Tampermonkey userscript adding a persistent queue manager to YouTube. Features a floating control bar, drag-to-reorder panel, and thumbnail hover buttons. Supports cross-tab control, auto-advance, play-next, history navigation, media keys, auto theater mode, and localStorage persistence.
+YouTube's built-in queue is clunky and disappears between sessions. This userscript replaces it with a persistent, fully-featured queue manager. Add videos from thumbnail hover buttons without leaving the page, drag to reorder, and pick up exactly where you left off. Control playback from any tab, navigate history with your media keys, and tweak behaviour through a built-in settings menu including auto theater mode for narrow windows.
 
 # Quick start
 
