@@ -39,7 +39,7 @@ Pick one for your browser:
 
 Click the button below — your userscript manager will open and prompt you to confirm:
 
-[![Install](https://img.shields.io/badge/Install-YouTube%20Custom%20Queue-green?style=for-the-badge)](https://raw.githubusercontent.com/Alpacinator/Youtube-Custom-Queue/main/YT_Q.js)
+[![Install](https://img.shields.io/badge/Install-YouTube%20Custom%20Queue-green?style=for-the-badge)](https://raw.githubusercontent.com/Alpacinator/Youtube-Custom-Queue/main/Youtube-custom-queue.user.js)
 
 Or install manually:
 1. Click the Tampermonkey icon → **Create a new script**
