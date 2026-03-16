@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name YouTube Queue Manager Test
+// @name YouTube Queue Manager
 // @namespace https://github.com/Alpacinator/Youtube-Custom-Queue/
 // @version 1.1.0
 // @description A persistent, cross-tab YouTube queue manager with drag-to-reorder, auto-advance, and optional auto theater mode.
