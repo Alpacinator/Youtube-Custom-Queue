@@ -2,6 +2,12 @@
 
 A Greasemonkey/Tampermonkey userscript adding a persistent queue manager to YouTube. Features a floating control bar, drag-to-reorder panel, and thumbnail hover buttons. Supports cross-tab control, auto-advance, play-next, history navigation, media keys, auto theater mode, and localStorage persistence.
 
+# Quick start
+
+Click the button below, your userscript manager will open and prompt you to confirm:
+
+[![Install](https://img.shields.io/badge/Install-YouTube%20Custom%20Queue-green?style=for-the-badge)](https://raw.githubusercontent.com/Alpacinator/Youtube-Custom-Queue/main/Youtube-custom-queue.user.js)
+
 ---
 
 ## Features
