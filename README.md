@@ -75,13 +75,13 @@ Pick one for your browser:
 - Click **≡ Queue** to open the panel
 - **Drag** items to reorder them (the currently playing item is locked in place)
 - Click **✕** next to an item to remove it
-- Click the **Queue** title in the panel header to open Settings
+- Click the **Queue** heading at the top of the panel to open Settings
 
 ---
 
 ## Settings
 
-Open the settings panel by clicking the **Queue** label at the top of the queue panel.
+Open the settings panel by clicking the **Queue** heading at the top of the open queue panel.
 
 | Setting | Description |
 |---|---|
