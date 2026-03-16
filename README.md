@@ -1,6 +1,6 @@
 # YouTube Custom Queue
 
-A Tampermonkey userscript adding a persistent queue manager to YouTube. Features a floating control bar, drag-to-reorder panel, and thumbnail hover buttons. Supports cross-tab control, auto-advance, play-next, history navigation, media keys, auto theater mode, and localStorage persistence.
+A Greasemonkey/Tampermonkey userscript adding a persistent queue manager to YouTube. Features a floating control bar, drag-to-reorder panel, and thumbnail hover buttons. Supports cross-tab control, auto-advance, play-next, history navigation, media keys, auto theater mode, and localStorage persistence.
 
 ---
 
@@ -23,24 +23,29 @@ A Tampermonkey userscript adding a persistent queue manager to YouTube. Features
 
 This is a **userscript**, a small piece of JavaScript that runs in your browser on top of existing websites. To use it, you need a userscript manager extension installed first.
 
-### Step 1, Install a userscript manager
+### Step 1 — Install a userscript manager
 
 Pick one for your browser:
 
 | Browser | Recommended extension |
 |---|---|
-| Firefox | [Greasemonkey](https://www.greasespot.net/) or [Tampermonkey](https://www.tampermonkey.net/)|
+| Firefox | [Greasemonkey](https://www.greasespot.net/) or [Tampermonkey](https://www.tampermonkey.net/) |
 | Chrome / Edge / Brave | [Tampermonkey](https://www.tampermonkey.net/) |
 | Safari | [Userscripts](https://apps.apple.com/app/userscripts/id1463298887) |
 
 > Tampermonkey is recommended across the board, it is the most actively maintained and has the widest compatibility.
 
-### Step 2, Install the script
+### Step 2 — Install the script
 
-1. Click the Tampermonkey icon in your browser toolbar and choose **Create a new script**
-2. Delete any placeholder code in the editor
-3. Copy the entire contents of [`youtube-custom-queue.user.js`](./youtube-custom-queue.user.js) and paste it in
-4. Press **Ctrl+S** (or **Cmd+S** on Mac) to save
+Click the button below — your userscript manager will open and prompt you to confirm:
+
+[![Install](https://img.shields.io/badge/Install-YouTube%20Custom%20Queue-green?style=for-the-badge)](https://raw.githubusercontent.com/Alpacinator/Youtube-Custom-Queue/main/YT_Q.js)
+
+Or install manually:
+1. Click the Tampermonkey icon → **Create a new script**
+2. Delete any placeholder code
+3. Copy the contents of [`YT_Q.js`](./YT_Q.js) and paste it in
+4. Press **Ctrl+S** (Cmd+S on Mac) to save
 5. Navigate to [youtube.com](https://www.youtube.com), the control bar will appear in the bottom-left corner
 
 ---
