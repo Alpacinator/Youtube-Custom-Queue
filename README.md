@@ -23,7 +23,7 @@ A Greasemonkey/Tampermonkey userscript adding a persistent queue manager to YouT
 
 This is a **userscript**, a small piece of JavaScript that runs in your browser on top of existing websites. To use it, you need a userscript manager extension installed first.
 
-### Step 1 — Install a userscript manager
+### Step 1: Install a userscript manager
 
 Pick one for your browser:
 
@@ -35,9 +35,9 @@ Pick one for your browser:
 
 > Tampermonkey is recommended across the board, it is the most actively maintained and has the widest compatibility.
 
-### Step 2 — Install the script
+### Step 2: Install the script
 
-Click the button below — your userscript manager will open and prompt you to confirm:
+Click the button below, your userscript manager will open and prompt you to confirm:
 
 [![Install](https://img.shields.io/badge/Install-YouTube%20Custom%20Queue-green?style=for-the-badge)](https://raw.githubusercontent.com/Alpacinator/Youtube-Custom-Queue/main/Youtube-custom-queue.user.js)
 
