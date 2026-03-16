@@ -29,8 +29,8 @@ Pick one for your browser:
 
 | Browser | Recommended extension |
 |---|---|
+| Firefox | [Greasemonkey](https://www.greasespot.net/) or [Tampermonkey](https://www.tampermonkey.net/)|
 | Chrome / Edge / Brave | [Tampermonkey](https://www.tampermonkey.net/) |
-| Firefox | [Tampermonkey](https://www.tampermonkey.net/) or [Greasemonkey](https://www.greasespot.net/) |
 | Safari | [Userscripts](https://apps.apple.com/app/userscripts/id1463298887) |
 
 > Tampermonkey is recommended across the board, it is the most actively maintained and has the widest compatibility.
@@ -42,8 +42,6 @@ Pick one for your browser:
 3. Copy the entire contents of [`youtube-custom-queue.user.js`](./youtube-custom-queue.user.js) and paste it in
 4. Press **Ctrl+S** (or **Cmd+S** on Mac) to save
 5. Navigate to [youtube.com](https://www.youtube.com), the control bar will appear in the bottom-left corner
-
-Alternatively, if you host the raw `.user.js` file somewhere (e.g. GitHub Raw), you can install it in one click by opening that URL directly, Tampermonkey will detect it and prompt you to install.
 
 ---
 
