@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name YouTube Custom Queue
-// @namespace https://github.com/Alpacinator/Youtube-Custom-Queue/
-// @version 1.0.0
+// @name YouTube Queue Manager
+// @namespace https://github.com/Alpacinator/Youtube-Custom-Queue
+// @version 1.0.1
 // @description A persistent, cross-tab YouTube queue manager with drag-to-reorder, auto-advance, and optional auto theater mode.
 // @author You
 // @match *://*.youtube.com/*
@@ -498,7 +498,15 @@
             this._scheduleEndPoll(video);
             this._registerMediaSession();
             this._updateMediaSessionMetadata(queueItem);
-            if (queueItem.title) document.title = `${queueItem.title} - YouTube`;
+            if (queueItem.title) {
+                document.title = `${queueItem.title} - YouTube`;
+                const h1 = document.querySelector(SEL.WATCH_TITLE);
+                if (h1) { h1.textContent = queueItem.title; h1.setAttribute('title', queueItem.title); }
+            }
+            if (queueItem.channel) {
+                const el = document.querySelector(SEL.CHANNEL_NAME);
+                if (el) { el.textContent = queueItem.channel; el.setAttribute('title', queueItem.channel); }
+            }
         },
 
         _attachVideoListeners(video) {
