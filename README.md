@@ -44,7 +44,7 @@ Click the button below, your userscript manager will open and prompt you to conf
 Or install manually:
 1. Click the Tampermonkey icon → **Create a new script**
 2. Delete any placeholder code
-3. Copy the contents of [`YT_Q.js`](./YT_Q.js) and paste it in
+3. Copy the contents of [`Youtube-custom-queue.user.js`](./Youtube-custom-queue.user.js) and paste it in
 4. Press **Ctrl+S** (Cmd+S on Mac) to save
 5. Navigate to [youtube.com](https://www.youtube.com), the control bar will appear in the bottom-left corner
 
