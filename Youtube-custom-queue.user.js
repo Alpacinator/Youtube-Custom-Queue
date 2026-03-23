@@ -1,13 +1,51 @@
 // ==UserScript==
 // @name YouTube Queue Manager
 // @namespace https://github.com/Alpacinator/Youtube-Custom-Queue/
-// @version 1.1.0
+// @version 1.1.1
 // @description A persistent, cross-tab YouTube queue manager with drag-to-reorder, auto-advance, and optional auto theater mode.
 // @author You
 // @match *://*.youtube.com/*
 // @grant none
 // @run-at document-start
 // ==/UserScript==
+
+/**
+ * YouTube Queue Manager
+ *
+ * A persistent, cross-tab queue manager injected into YouTube via a userscript.
+ *
+ * Architecture overview:
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  Storage        Persists queue, history, and pause state to localStorage.
+ *                 An in-memory cache is invalidated whenever another tab writes.
+ *
+ *  PlayingTab     Claims "ownership" of playback via a heartbeat in localStorage
+ *                 so that other tabs know not to also start playing.
+ *
+ *  Navigator      Uses YouTube's internal yt-navigate event to perform SPA
+ *                 navigation without triggering a full page reload.
+ *
+ *  Player         Owns the end-to-end playback lifecycle: attaches to the
+ *                 <video> element, drives the end-poll timer, integrates with
+ *                 the MediaSession API, and advances/stops the queue.
+ *
+ *  ThumbnailInjector
+ *                 Injects a circular "+"/"-" button onto every video thumbnail.
+ *                 Uses a MutationObserver so freshly rendered thumbnails are
+ *                 covered automatically.
+ *
+ *  UI             Builds the button bar, sliding queue panel, and settings modal
+ *                 inside a Shadow DOM so YouTube styles cannot bleed in.
+ *
+ *  TheaterMode    Optionally toggles YouTube's theater mode based on window width.
+ *
+ *  ContextMenuBlocker / NativeButtonHider
+ *                 Optional quality-of-life suppressors toggled from settings.
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * Cross-tab communication is achieved entirely through localStorage events;
+ * no BroadcastChannel or service worker is required.
+ */
 
 (function() {
 	'use strict';
@@ -16,29 +54,87 @@
 	// CONFIG
 	// ─────────────────────────────────────────────
 
+	/** localStorage key that stores the serialised queue / history / paused state. */
 	const STORAGE_KEY = 'yt_queue_manager_v1';
+
+	/** localStorage key that holds the TAB_ID of whichever tab currently owns playback. */
 	const PLAYING_KEY = 'yt_queue_playing_tab';
+
+	/** localStorage key updated every HEARTBEAT_INTERVAL_MS by the playing tab so
+	 *  other tabs can detect whether it is still alive. */
 	const HEARTBEAT_KEY = 'yt_queue_heartbeat';
+
+	/** localStorage key written by any tab that wants the playing tab to skip the
+	 *  current video. Written then immediately removed; other tabs react in the
+	 *  storage event handler. */
 	const SKIP_KEY = 'yt_queue_skip_signal';
+
+	/** localStorage key that persists user settings (toggles, intervals). */
 	const SETTINGS_KEY = 'yt_queue_settings_v1';
 
+	/** How often (ms) the playing tab refreshes its heartbeat timestamp. */
 	const HEARTBEAT_INTERVAL_MS = 3000;
+
+	/** If no heartbeat has been written within this window (ms), the playing tab
+	 *  is considered dead and its lock is ignored by other tabs. */
 	const HEARTBEAT_TTL_MS = 10000;
+
+	/** How many seconds from the end of a video the queue treats it as "ended"
+	 *  and advances to the next item. Avoids waiting for the exact last frame. */
 	const VIDEO_END_THRESHOLD_S = 2;
+
+	/** Maximum number of entries kept in the playback history (used by Prev). */
 	const HISTORY_MAX = 10;
+
+	/** Maximum time (ms) to wait for the correct <video> element to appear after
+	 *  a navigation before giving up and stopping the queue. */
 	const NAV_TIMEOUT_MS = 15000;
+
+	/** Poll interval (ms) used when waiting for the <video> element to become
+	 *  ready after navigation. */
 	const ATTACH_POLL_INTERVAL_MS = 500;
+
+	/** Unused in current logic — originally tracked max retries for play-forcing. */
 	const ENSURE_PLAYING_ATTEMPTS = 24;
+
+	/** Delay (ms) between retries when trying to force playback to start. */
 	const ENSURE_PLAYING_DELAY_MS = 250;
+
+	/** Extra delay (ms) before re-registering MediaSession handlers after video
+	 *  attachment, giving YouTube time to reinitialise its own handlers first. */
 	const MEDIASESSION_DELAYED_MS = 1000;
+
+	/** How long (ms) after the cursor leaves a thumbnail card before its overlay
+	 *  button fades out. */
 	const THUMBNAIL_HIDE_DELAY_MS = 1000;
+
+	/** How often (ms) the ThumbnailInjector prunes stale card entries that are
+	 *  no longer in the DOM. */
 	const THUMBNAIL_PRUNE_MS = 30000;
+
+	/** Debounce delay (ms) for the theater-mode resize listener. */
 	const THEATER_RESIZE_DEBOUNCE_MS = 800;
+
+	/** Debounce delay (ms) for the theater-mode window-focus listener. */
 	const THEATER_FOCUS_DEBOUNCE_MS = 300;
+
+	/** Window width fraction below which theater mode is automatically activated
+	 *  (i.e. window is narrower than 60% of the screen). */
 	const THEATER_MIN_WIDTH_RATIO = 0.6;
+
+	/** Delay (ms) to wait after a URL change fires before treating it as settled
+	 *  (prevents double-handling during popstate + yt-navigate-finish races). */
 	const URL_CHANGE_SETTLE_MS = 500;
+
+	/** How long (ms) the thumbnail button shows its flash state (checkmark/minus/skip)
+	 *  before resetting. */
 	const BTN_FLASH_DURATION_MS = 2000;
+
+	/** How long (ms) the main "Add to Queue" button shows its temporary label
+	 *  before returning to normal. */
 	const BTN_TEMP_TEXT_DURATION_MS = 1800;
+
+	/** How long (ms) the status pill at the bottom-left is visible before fading. */
 	const STATUS_DEFAULT_DURATION_MS = 3500;
 
 	// ── Thumbnail overlay button colours ─────────────────────────────────
@@ -47,30 +143,50 @@
 	const THUMB_BTN_GREEN_RGB = '0,210,100'; // idle (add) + added flash
 	const THUMB_BTN_RED_RGB = '220,50,50'; // dupe (remove) + removed flash
 	const THUMB_BTN_BLUE_RGB = '30,144,255'; // next (play-next) flash
-	const THUMB_BTN_OPACITY = 0.55; // shared opacity for all three
+	const THUMB_BTN_OPACITY = 0.45; // shared opacity for all three
 
+	/** Default values for every user-configurable setting. Merged with whatever
+	 *  is persisted in localStorage so new keys always have a fallback. */
 	const SETTINGS_DEFAULTS = {
-		remoteControls: true,
-		theaterMode: false,
-		blockContextMenu: true,
-		mediaSessionRefresh: true,
-		mediaSessionRefreshInterval: 5,
-		hideNativeButtons: true, // hide YouTube's own Watch Later / Add to Queue thumbnail buttons
+		remoteControls: true, // Show cross-tab pause/skip/prev buttons
+		theaterMode: false, // Auto theater mode based on window width
+		blockContextMenu: true, // Suppress right-click menu site-wide
+		mediaSessionRefresh: true, // Periodically re-register media-key handlers
+		mediaSessionRefreshInterval: 5, // Seconds between re-registrations
+		hideNativeButtons: true, // Hide YouTube's own hover buttons on thumbnails
+		restartFromBeginning: false, // Seek to 0:00 on every queue navigation
 	};
 
+	/**
+	 * Centralised CSS selectors used throughout the script.
+	 * Keeping them here makes it easy to update when YouTube changes its DOM.
+	 */
 	const SEL = {
+		/** Selectors for video card containers on listing pages (home, search, sidebar). */
 		CARD: [
 			'.yt-lockup-view-model',
 			'ytd-rich-item-renderer',
 			'ytd-compact-video-renderer',
 			'ytd-video-renderer',
 		].join(', '),
+
+		/** The main YouTube HTML5 player wrapper element. */
 		PLAYER: '#movie_player, .html5-video-player',
+
+		/** Anchor tags used in the end-of-video suggestion wall. */
 		VIDEOWALL_ANCHOR: 'a.ytp-suggestion-set[href*="/watch?v="]',
+
+		/** Theater-mode toggle button (two selector variants for robustness). */
 		THEATER_BTN_DATA: 'button[data-tooltip-target-id="ytp-size-button"]',
 		THEATER_BTN_CLASS: '.ytp-size-button',
+
+		/** Play overlays shown when a video is cued but not yet started. */
 		PLAY_OVERLAY: '.ytp-large-play-button, .ytp-cued-thumbnail-overlay',
+
+		/** Play/pause button in the player toolbar. */
 		PLAY_TOOLBAR: '.ytp-play-button',
+
+		/** Video title <h1> on the watch page (multiple selectors for layout variants). */
 		WATCH_TITLE: [
 			'ytd-watch-metadata h1 yt-formatted-string',
 			'h1.ytd-watch-metadata yt-formatted-string',
@@ -78,8 +194,14 @@
 			'h1.title yt-formatted-string',
 			'h1.title',
 		].join(', '),
+
+		/** Channel name element on the watch page. */
 		CHANNEL_NAME: '#channel-name yt-formatted-string#text, ytd-channel-name yt-formatted-string',
+
+		/** Top-level watch-page container; has a "theater" attribute in theater mode. */
 		WATCH_FLEXY: 'ytd-watch-flexy',
+
+		/** Root elements the ThumbnailInjector's MutationObserver attaches to. */
 		THUMB_OBSERVER_ROOTS: 'ytd-app, #content, #primary, #secondary',
 	};
 
@@ -101,6 +223,11 @@
 	// TAB ID
 	// ─────────────────────────────────────────────
 
+	/**
+	 * A random identifier for this browser tab, persisted in sessionStorage so it
+	 * survives page refreshes within the same tab but is discarded when the tab
+	 * is closed. Used to distinguish "am I the playing tab?" from other tabs.
+	 */
 	const TAB_ID = (() => {
 		let id = sessionStorage.getItem('ytqm_tab_id');
 		if (!id) {
@@ -113,6 +240,12 @@
 	// ─────────────────────────────────────────────
 	// SETTINGS MODULE
 	// ─────────────────────────────────────────────
+
+	/**
+	 * Thin wrapper around localStorage for user preferences.
+	 * Always merges stored values with SETTINGS_DEFAULTS so missing keys
+	 * are transparently backfilled on read.
+	 */
 	const Settings = {
 		_defaults() {
 			return {
@@ -120,6 +253,7 @@
 			};
 		},
 
+		/** Returns the full settings object, merging stored values with defaults. */
 		get() {
 			try {
 				const raw = localStorage.getItem(SETTINGS_KEY);
@@ -129,6 +263,7 @@
 			}
 		},
 
+		/** Persists a single setting key-value pair. */
 		set(key, value) {
 			const s = this.get();
 			s[key] = value;
@@ -141,6 +276,21 @@
 	// ─────────────────────────────────────────────
 	// STORAGE MODULE
 	// ─────────────────────────────────────────────
+
+	/**
+	 * Manages persistent state (queue, history, paused flag) in localStorage.
+	 *
+	 * An in-memory cache (_cache) avoids redundant JSON parse/stringify on every
+	 * access. The cache is invalidated by _invalidate() whenever the storage event
+	 * fires, signalling that another tab has written new data.
+	 *
+	 * Schema stored under STORAGE_KEY:
+	 * {
+	 *   queue:   Array<{ url, title, channel, id }>  — upcoming videos
+	 *   history: Array<{ url, title, channel, id }>  — recently played (capped at HISTORY_MAX)
+	 *   paused:  boolean                             — cross-tab pause flag
+	 * }
+	 */
 	const Storage = {
 		_cache: null,
 
@@ -152,10 +302,15 @@
 			};
 		},
 
+		/** Drops the in-memory cache so the next .load() re-reads from localStorage. */
 		_invalidate() {
 			this._cache = null;
 		},
 
+		/**
+		 * Returns the full state object, reading from localStorage only when the
+		 * cache is cold. Guarantees all keys exist even if storage is stale/corrupt.
+		 */
 		load() {
 			if (this._cache) return this._cache;
 			try {
@@ -167,7 +322,7 @@
 				const p = JSON.parse(raw);
 				if (p.paused === undefined) p.paused = false;
 				if (!Array.isArray(p.history)) p.history = [];
-				delete p.playing;
+				delete p.playing; // Remove legacy key from older versions
 				this._cache = p;
 				return this._cache;
 			} catch (e) {
@@ -177,6 +332,7 @@
 			}
 		},
 
+		/** Writes the state object to localStorage and updates the cache. */
 		save(state) {
 			try {
 				this._cache = state;
@@ -189,6 +345,8 @@
 				warn('Storage.save failed:', e);
 			}
 		},
+
+		// ── Convenience getters (return copies to prevent accidental mutation) ──
 
 		get queue() {
 			return [...this.load().queue];
@@ -206,6 +364,10 @@
 			this.save(s);
 		},
 
+		/**
+		 * Appends a video to the history ring-buffer, evicting the oldest
+		 * entry when the buffer exceeds HISTORY_MAX.
+		 */
 		pushHistory(video) {
 			const s = this.load();
 			s.history.push({
@@ -217,6 +379,7 @@
 			log('History push:', video.title, '— depth:', s.history.length);
 		},
 
+		/** Removes and returns the most recently played video, or null if empty. */
 		popHistory() {
 			const s = this.load();
 			const prev = s.history.pop();
@@ -224,6 +387,10 @@
 			return prev || null;
 		},
 
+		/**
+		 * Appends a video to the end of the queue.
+		 * Returns false (without writing) if the URL is already present.
+		 */
 		addVideo(url, title, channel = '') {
 			const s = this.load();
 			if (s.queue.find(v => v.url === url)) {
@@ -241,18 +408,24 @@
 			return true;
 		},
 
+		/** Removes a queue entry by its numeric id. */
 		removeVideo(id) {
 			const s = this.load();
 			s.queue = s.queue.filter(v => v.id !== id);
 			this.save(s);
 		},
 
+		/** Removes a queue entry by URL (used by the thumbnail button). */
 		removeVideoByUrl(url) {
 			const s = this.load();
 			s.queue = s.queue.filter(v => v.url !== url);
 			this.save(s);
 		},
 
+		/**
+		 * Removes and returns the first queue entry ("consume" for playback).
+		 * Returns undefined when the queue is empty.
+		 */
 		shiftQueue() {
 			const s = this.load();
 			const next = s.queue.shift();
@@ -260,10 +433,21 @@
 			return next;
 		},
 
+		/** Returns the first queue entry without removing it. */
 		peekFirst() {
 			return this.load().queue[0] || null;
 		},
 
+		/**
+		 * Inserts (or moves) a video to a specific queue position.
+		 * If the URL is already in the queue it is first removed from its current
+		 * position so there are never duplicates.
+		 *
+		 * @param {string} url
+		 * @param {string} title
+		 * @param {string} channel
+		 * @param {number} insertAt  - 0 = front, 1 = second (after currently playing), etc.
+		 */
 		insertNext(url, title, channel = '', insertAt = 0) {
 			const s = this.load();
 			s.queue = s.queue.filter(v => v.url !== url);
@@ -277,6 +461,15 @@
 			log('Inserted as next:', title, 'at index', insertAt);
 		},
 
+		/**
+		 * Moves a queue item from index `from` to index `to`.
+		 * When the queue is playing, index 0 (currently playing) is locked and
+		 * cannot be the source or destination.
+		 *
+		 * @param {number}  from
+		 * @param {number}  to
+		 * @param {boolean} isPlaying  - when true, clamps both indices to >= 1
+		 */
 		reorder(from, to, isPlaying = false) {
 			const min = isPlaying ? 1 : 0;
 			from = Math.max(from, min);
@@ -292,6 +485,13 @@
 	// ─────────────────────────────────────────────
 	// CROSS-TAB STORAGE EVENT LISTENER
 	// ─────────────────────────────────────────────
+
+	/**
+	 * Listens for localStorage changes written by other tabs and reacts accordingly:
+	 *  - STORAGE_KEY change              → invalidate cache, refresh UI, sync thumbnails
+	 *  - PLAYING_KEY / HEARTBEAT_KEY     → refresh the remote-pause button visibility
+	 *  - SKIP_KEY change (non-null value) → if this tab is playing, execute the skip
+	 */
 	window.addEventListener('storage', e => {
 		if (e.key === STORAGE_KEY) {
 			Storage._invalidate();
@@ -308,15 +508,28 @@
 	// ─────────────────────────────────────────────
 	// PLAYING TAB
 	// ─────────────────────────────────────────────
+
+	/**
+	 * Manages the "playing tab" lock in localStorage.
+	 *
+	 * Only one tab should drive playback at a time. When a tab starts the queue it
+	 * calls claim(), which writes its TAB_ID to PLAYING_KEY and starts a repeating
+	 * heartbeat. Other tabs can call anyPlaying() to check whether a live owner
+	 * exists before deciding whether to show remote-control buttons.
+	 *
+	 * The lock is released automatically via the beforeunload handler below.
+	 */
 	const PlayingTab = {
 		_heartbeatTimer: null,
 
+		/** Acquires the playing-tab lock and starts the heartbeat. */
 		claim() {
 			localStorage.setItem(PLAYING_KEY, TAB_ID);
 			this._beat();
 			this._heartbeatTimer = setInterval(() => this._beat(), HEARTBEAT_INTERVAL_MS);
 		},
 
+		/** Releases the lock and stops the heartbeat. No-op if this tab is not the owner. */
 		release() {
 			if (!this.isOwner()) return;
 			clearInterval(this._heartbeatTimer);
@@ -325,10 +538,15 @@
 			localStorage.removeItem(HEARTBEAT_KEY);
 		},
 
+		/** Returns true if this tab currently holds the playing-tab lock. */
 		isOwner() {
 			return localStorage.getItem(PLAYING_KEY) === TAB_ID;
 		},
 
+		/**
+		 * Returns true if any tab (including this one) is currently playing.
+		 * A foreign tab is considered alive only if its heartbeat is fresh.
+		 */
 		anyPlaying() {
 			if (this.isOwner()) return true;
 			if (!localStorage.getItem(PLAYING_KEY)) return false;
@@ -336,17 +554,22 @@
 			return (Date.now() - ts) < HEARTBEAT_TTL_MS;
 		},
 
+		/** Writes the current timestamp to act as a liveness signal. */
 		_beat() {
 			localStorage.setItem(HEARTBEAT_KEY, Date.now().toString());
 		},
 	};
 
+	// Release the playing-tab lock when this tab is closed or navigated away from.
 	window.addEventListener('beforeunload', () => PlayingTab.release());
 
 	// ─────────────────────────────────────────────
 	// PAGE TYPE
 	// ─────────────────────────────────────────────
+
+	/** Utility helpers for determining the current YouTube page type. */
 	const Page = {
+		/** Returns true when the current URL is a watch page (has a `v=` param). */
 		isWatchPage() {
 			return !!new URLSearchParams(location.search).get('v');
 		},
@@ -355,6 +578,21 @@
 	// ─────────────────────────────────────────────
 	// NAVIGATOR
 	// ─────────────────────────────────────────────
+
+	/**
+	 * Performs YouTube SPA navigation without a full page reload.
+	 *
+	 * YouTube uses a custom `yt-navigate` event to handle link clicks internally.
+	 * We hijack this by:
+	 *   1. Finding any anchor to a video that is NOT in the queue (to avoid
+	 *      accidentally clicking something the user intended to navigate to).
+	 *   2. Intercepting the resulting `yt-navigate` event and mutating its
+	 *      endpoint to point at our target video ID instead.
+	 *   3. Clicking the hijacked anchor to dispatch the event.
+	 *
+	 * A second `yt-navigate` event fired by the original anchor (if any) is
+	 * blocked to prevent a double-navigation race.
+	 */
 	const Navigator = {
 		goTo(url) {
 			const parsed = new URL(url, location.origin);
@@ -362,6 +600,8 @@
 			const expectedId = parsed.searchParams.get('v');
 			log('Navigating to:', path);
 
+			// Build the set of video IDs already in the queue so we can avoid
+			// hijacking an anchor that points to one of them.
 			const queueUrls = new Set(Storage.queue.map(v => {
 				try {
 					return new URL(v.url, location.origin).searchParams.get('v');
@@ -370,6 +610,7 @@
 				}
 			}).filter(Boolean));
 
+			// Find the first watch-page anchor whose target video is NOT in the queue.
 			const anchor = [...document.querySelectorAll('a[href*="/watch?v="]')].find(a => {
 				try {
 					const vid = new URL(a.href, location.origin).searchParams.get('v');
@@ -391,7 +632,7 @@
 				const vid = e.detail.endpoint?.watchEndpoint?.videoId;
 
 				if (!mutated) {
-					// First yt-navigate — mutate it to our target
+					// First yt-navigate event: rewrite its endpoint to our target.
 					log('Mutating yt-navigate endpoint from', vid, 'to', expectedId);
 					const ep = e.detail.endpoint;
 					if (ep.watchEndpoint) ep.watchEndpoint.videoId = expectedId;
@@ -401,14 +642,15 @@
 					ep.clickTrackingParams = '';
 					mutated = true;
 				} else {
-					// Second yt-navigate — this is the original anchor firing again, block it
+					// Second yt-navigate event: the original anchor is re-firing; block it.
 					log('Blocking duplicate yt-navigate for', vid);
 					e.stopImmediatePropagation();
 					e.preventDefault();
 				}
 			};
 
-			// Listen for multiple events, remove after 2 seconds
+			// Capture-phase listener so we intercept before YouTube's own handler.
+			// Automatically removed after 2 s to avoid leaking across navigations.
 			window.addEventListener('yt-navigate', handler, {
 				capture: true
 			});
@@ -423,6 +665,26 @@
 	// ─────────────────────────────────────────────
 	// PLAYER MODULE
 	// ─────────────────────────────────────────────
+
+	/**
+	 * Manages the full playback lifecycle for the queue.
+	 *
+	 * State flags:
+	 *   _playing          — true while the queue is running (not necessarily while
+	 *                       the video itself is un-paused).
+	 *   _userPaused       — true after the user manually pauses; prevents the script
+	 *                       from trying to force-resume after a remote pause/resume cycle.
+	 *   _navigatingToPrev — guard to prevent multiple simultaneous "go to previous" navigations.
+	 *   _attachedVideoId  — the video ID that _onVideoReady has already been called for;
+	 *                       prevents double-attachment if yt-navigate-finish fires again.
+	 *
+	 * Playback lifecycle:
+	 *   start() → Navigator.goTo() (or direct attach if already on target page)
+	 *           → _waitForVideoAndPlay() polls until <video> is ready
+	 *           → _onVideoReady() attaches listeners + starts end-poll timer
+	 *           → _scheduleEndPoll() fires advance() near video end
+	 *           → advance() → Navigator.goTo() next, or stop()
+	 */
 	const Player = {
 		_playing: false,
 		_userPaused: false,
@@ -431,7 +693,13 @@
 		_attachedVideoId: null,
 		_ensurePlayingTimer: null,
 		_mediaSessionRefreshTimer: null,
+		_pendingSeekToStart: false,
 
+		/**
+		 * Starts the queue from the first item.
+		 * Claims the playing-tab lock, then navigates to the first video (or
+		 * attaches directly if already on the correct page).
+		 */
 		start() {
 			this._playing = true;
 			PlayingTab.claim();
@@ -454,14 +722,15 @@
 			}
 
 			if (currentId === expectedId) {
+				// Already on the right page; skip navigation and attach directly.
 				log('Already on the correct page — attaching directly');
 				this._waitForVideoAndPlay();
 			} else {
-				// Works for both watch→watch and non-watch→watch navigation
 				Navigator.goTo(first.url);
 			}
 		},
 
+		/** Stops the queue, releases all resources, and resets all state flags. */
 		stop() {
 			log('Stopping queue');
 			if (this._ensurePlayingTimer) {
@@ -480,15 +749,23 @@
 			UI.showStatus('Queue stopped');
 		},
 
+		/** Broadcasts a cross-tab pause signal (does not touch the local <video>). */
 		remotePause() {
 			Storage.setPaused(true);
 			UI.updateRemotePauseBtn();
 		},
+
+		/** Broadcasts a cross-tab resume signal. */
 		remoteResume() {
 			Storage.setPaused(false);
 			UI.updateRemotePauseBtn();
 		},
 
+		/**
+		 * Skips the current video.
+		 * If this tab owns playback, skips directly; otherwise writes a signal to
+		 * localStorage for the playing tab to act on.
+		 */
 		remoteSkip() {
 			if (this._playing) {
 				this.skip();
@@ -497,6 +774,7 @@
 			localStorage.setItem(SKIP_KEY, Date.now().toString());
 		},
 
+		/** Called by the storage event handler when another tab has written SKIP_KEY. */
 		_onRemoteSkip() {
 			if (!this._playing) return;
 			log('Remote skip received');
@@ -504,6 +782,11 @@
 			this.skip();
 		},
 
+		/**
+		 * Reacts to a change in Storage.paused (written by any tab).
+		 * Pauses or resumes the local <video> element to match the shared state,
+		 * but only when this tab is the playing tab.
+		 */
 		_onPauseStorageChange() {
 			if (!this._playing) return;
 			const video = document.querySelector('video');
@@ -512,19 +795,28 @@
 			const trulyPlaying = !video.paused && !video.ended && video.readyState >= 3;
 			if (shouldPause && trulyPlaying) {
 				video.pause();
-				UI.showStatus('⏸ Paused by another tab');
+				UI.showStatus('Paused by another tab');
 			} else if (!shouldPause && video.paused && !video.ended && !this._userPaused) {
 				video.play().catch(() => this._clickPlayButton());
-				UI.showStatus('▶ Resumed by another tab');
+				UI.showStatus('Resumed by another tab');
 			}
 		},
 
+		/**
+		 * Schedules a recurring check that fires advance() when the video is about
+		 * to end (within VIDEO_END_THRESHOLD_S seconds of the end, or when
+		 * video.ended is true).
+		 *
+		 * Adaptive scheduling: when more than 30 s remain, the next check is
+		 * deferred until ~28 s before the end, reducing unnecessary timer work.
+		 */
 		_scheduleEndPoll(video) {
 			this._clearEndPoll();
 			if (!this._playing || !video) return;
 
 			const check = () => {
 				if (!this._playing) return;
+				// Don't advance while paused cross-tab; retry in 1 s.
 				if (Storage.paused) {
 					this._endPollTimer = setTimeout(check, 1000);
 					return;
@@ -539,8 +831,10 @@
 					Storage.setPaused(false);
 					this.advance();
 				} else if (!isNaN(remaining) && remaining > 30) {
+					// Far from the end; sleep until 28 s before the end.
 					this._endPollTimer = setTimeout(check, (remaining - 28) * 1000);
 				} else {
+					// Close to the end; poll every second.
 					this._endPollTimer = setTimeout(check, 1000);
 				}
 			};
@@ -550,6 +844,7 @@
 			this._endPollTimer = setTimeout(check, delay);
 		},
 
+		/** Cancels any pending end-poll timer. */
 		_clearEndPoll() {
 			if (this._endPollTimer) {
 				clearTimeout(this._endPollTimer);
@@ -557,6 +852,17 @@
 			}
 		},
 
+		/**
+		 * Waits until the correct <video> element is ready for the first queue item,
+		 * then calls _onVideoReady().
+		 *
+		 * Readiness is defined as:
+		 *   - The URL contains the expected video ID.
+		 *   - A <video> element exists with readyState >= 1 (or currentTime > 0).
+		 *   - The YouTube player API (if available) also reports the correct video ID.
+		 *
+		 * Falls back to stopping the queue if NAV_TIMEOUT_MS elapses without success.
+		 */
 		_waitForVideoAndPlay() {
 			if (!this._playing) return;
 			const first = Storage.peekFirst();
@@ -580,16 +886,19 @@
 				const playerEl = document.querySelector('#movie_player');
 				if (playerEl && typeof playerEl.getVideoData === 'function') {
 					const data = playerEl.getVideoData();
+					// If the player reports a different video ID, it hasn't loaded ours yet.
 					if (data?.video_id && data.video_id !== expectedId) return false;
 				}
 				return video.readyState >= 1 || video.currentTime > 0;
 			};
 
+			// Fast path: video is already ready (e.g. already on the page).
 			if (tryAttach()) {
 				this._onVideoReady(document.querySelector('video'), first);
 				return;
 			}
 
+			// Slow path: poll until ready or timeout.
 			let resolved = false;
 			const pollTimer = setInterval(() => {
 				if (!tryAttach()) return;
@@ -614,6 +923,17 @@
 			}, NAV_TIMEOUT_MS);
 		},
 
+		/**
+		 * Called once the target <video> element is confirmed ready.
+		 * Attaches event listeners, starts the end-poll, registers MediaSession,
+		 * updates the page title/channel, and begins playback.
+		 *
+		 * Guards against re-entrancy with _attachedVideoId so that rapid
+		 * yt-navigate-finish events don't cause duplicate attachments.
+		 *
+		 * @param {HTMLVideoElement} video
+		 * @param {{ title: string, channel: string, url: string }} queueItem
+		 */
 		_onVideoReady(video, queueItem) {
 			const videoId = new URLSearchParams(location.search).get('v');
 			if (videoId && videoId === this._attachedVideoId) {
@@ -621,16 +941,16 @@
 				return;
 			}
 			this._attachedVideoId = videoId;
-			video._ytqmAttachedAt = Date.now();
+			video._ytqmAttachedAt = Date.now(); // Timestamp used to suppress early spurious pause events.
 
 			this._attachVideoListeners(video);
-
-			const trulyPlaying = !video.paused && !video.ended && video.readyState >= 3;
-			if (!trulyPlaying && !this._userPaused && !Storage.paused) this._ensurePlaying(video);
-
 			this._scheduleEndPoll(video);
 			this._registerMediaSession();
 			this._updateMediaSessionMetadata(queueItem);
+
+			// Override the page title and visible channel so the OS media overlay
+			// and browser tab title reflect the queue item rather than YouTube's
+			// auto-generated data (which can lag or differ).
 			if (queueItem.title) {
 				document.title = `${queueItem.title} - YouTube`;
 				const h1 = document.querySelector(SEL.WATCH_TITLE);
@@ -646,37 +966,118 @@
 					el.setAttribute('title', queueItem.channel);
 				}
 			}
+
+			// Honour cross-tab or user pause state before trying to play.
+			if (this._userPaused || Storage.paused) return;
+			this._startPlayback(video);
 		},
 
+		/**
+		 * Begins playback, optionally seeking to 0:00 first.
+		 *
+		 * If restartFromBeginning is enabled the video is paused, a seek to 0 is
+		 * issued, and play() is called from the 'seeked' event to ensure the seek
+		 * completes before playback starts.
+		 *
+		 * @param {HTMLVideoElement} video
+		 */
+		_startPlayback(video) {
+			const restartFromBeginning = Settings.get().restartFromBeginning;
+
+			const play = () => {
+				video.play().catch(() => this._clickPlayButton());
+			};
+
+			const seekThenPlay = () => {
+				video.currentTime = 0;
+				video.addEventListener('seeked', play, {
+					once: true
+				});
+			};
+
+			// Defer the actual play call until the video has enough data.
+			const whenReady = (fn) => {
+				if (video.readyState >= 3) fn();
+				else video.addEventListener('canplay', fn, {
+					once: true
+				});
+			};
+
+			video.pause();
+			whenReady(restartFromBeginning ? seekThenPlay : play);
+		},
+
+		/**
+		 * Attaches one-time and persistent event listeners to the <video> element.
+		 *
+		 * The _ytqmListening guard ensures listeners are only attached once per
+		 * video element (YouTube may reuse the same element across navigations).
+		 *
+		 * Listeners attached:
+		 *  pause        → sets _userPaused (ignoring early spurious pauses)
+		 *  play         → clears _userPaused, re-schedules end-poll if needed
+		 *  ended        → status message (advance is driven by the end-poll)
+		 *  waiting      → buffering status message
+		 *  durationchange → re-schedules end-poll with accurate duration
+		 *  canplay (once) → honours a pending seek-to-start request
+		 *
+		 * @param {HTMLVideoElement} video
+		 */
 		_attachVideoListeners(video) {
 			if (video._ytqmListening) return;
 			video._ytqmListening = true;
 
 			video.addEventListener('pause', () => {
 				if (!this._playing || video.ended || Storage.paused) return;
+				// Suppress the synthetic pause that often fires right after we call
+				// video.pause() inside _startPlayback, which happens within 3 s of attach.
 				if (Date.now() - (video._ytqmAttachedAt || 0) < 3000) {
 					log('Ignoring early pause event');
 					return;
 				}
 				this._userPaused = true;
 				log('Video paused by user');
-				UI.showStatus('⏸ Paused', 99999);
+				UI.showStatus('Paused', 99999);
 			});
 
 			video.addEventListener('play', () => {
 				this._userPaused = false;
 				log('Video playing');
-				UI.showStatus('▶ Playing', 2000);
+				UI.showStatus('Playing', 2000);
+				// The end-poll may have been cleared if the video was paused; restart it.
 				if (this._playing && !this._endPollTimer) this._scheduleEndPoll(video);
 			});
 
 			video.addEventListener('ended', () => UI.showStatus('Advancing queue…'));
 			video.addEventListener('waiting', () => UI.showStatus('Buffering…', 5000));
+
 			video.addEventListener('durationchange', () => {
+				// Re-calculate the end-poll delay now that we have an accurate duration.
 				if (this._playing && !isNaN(video.duration)) this._scheduleEndPoll(video);
+			});
+
+			// Handles the case where we need to restart from the beginning but the
+			// video wasn't buffered enough to seek immediately in _startPlayback.
+			video.addEventListener('canplay', () => {
+				if (!this._pendingSeekToStart) return;
+				this._pendingSeekToStart = false;
+				video.currentTime = 0;
+				video.addEventListener('seeked', () => {
+					if (!this._userPaused && !Storage.paused) {
+						video.play().catch(() => this._clickPlayButton());
+					}
+				}, {
+					once: true
+				});
+			}, {
+				once: true
 			});
 		},
 
+		/**
+		 * Shifts the current item off the queue, pushes it into history, and
+		 * navigates to the next video (or stops if the queue is now empty).
+		 */
 		advance() {
 			const current = Storage.shiftQueue();
 			if (current) Storage.pushHistory(current);
@@ -688,10 +1089,18 @@
 			else this.stop();
 		},
 
+		/** Advances the queue if currently playing; no-op otherwise. */
 		skip() {
 			if (this._playing) this.advance();
 		},
 
+		/**
+		 * Navigates to the previously played video by popping the history stack
+		 * and re-inserting it at the front of the queue.
+		 *
+		 * A _navigatingToPrev guard prevents multiple simultaneous navigations if
+		 * the button is clicked rapidly.
+		 */
 		previous() {
 			if (!this._playing) return;
 			if (this._navigatingToPrev) {
@@ -701,9 +1110,9 @@
 
 			const prev = Storage.popHistory();
 			if (!prev) {
-				UI.showStatus('⏮ No previous track', 2000);
+				UI.showStatus('No previous track', 2000);
 				log('previous(): history is empty');
-				this._registerMediaSession();
+				this._registerMediaSession(); // Refresh handlers so media keys remain responsive.
 				return;
 			}
 			log('Going to previous:', prev.title);
@@ -719,6 +1128,13 @@
 			Navigator.goTo(prev.url);
 		},
 
+		/**
+		 * Registers (or re-registers) the MediaSession nexttrack and previoustrack
+		 * action handlers so hardware media keys and OS media overlays work.
+		 *
+		 * YouTube's player often overwrites these handlers after initialising; the
+		 * "aggressive refresh" setting periodically re-registers to combat this.
+		 */
 		_registerMediaSession() {
 			if (!('mediaSession' in navigator)) {
 				warn('MediaSession API not available');
@@ -728,12 +1144,12 @@
 			const register = (label = 'MediaSession handlers registered') => {
 				navigator.mediaSession.setActionHandler('nexttrack', () => {
 					log('MediaSession: nexttrack');
-					UI.showStatus('⏭ Skipping…', 2000);
+					UI.showStatus('Skipping…', 2000);
 					this.skip();
 				});
 				navigator.mediaSession.setActionHandler('previoustrack', () => {
 					log('MediaSession: previoustrack');
-					UI.showStatus('⏮ Going to previous…', 2000);
+					UI.showStatus('Going to previous…', 2000);
 					this.previous();
 				});
 				log(label);
@@ -742,6 +1158,8 @@
 			const s = Settings.get();
 			register();
 
+			// Always do one delayed re-registration unless the interval-based refresh
+			// is active (which will cover the same window).
 			if (!s.mediaSessionRefresh) {
 				setTimeout(() => register('MediaSession handlers re-registered (delayed)'), MEDIASESSION_DELAYED_MS);
 			}
@@ -758,6 +1176,7 @@
 			}
 		},
 
+		/** Stops the periodic MediaSession refresh timer if running. */
 		_stopMediaSessionRefresh() {
 			if (this._mediaSessionRefreshTimer) {
 				clearInterval(this._mediaSessionRefreshTimer);
@@ -765,6 +1184,7 @@
 			}
 		},
 
+		/** Removes all MediaSession handlers and stops the refresh timer. */
 		_unregisterMediaSession() {
 			if (!('mediaSession' in navigator)) return;
 			this._stopMediaSessionRefresh();
@@ -777,6 +1197,12 @@
 			log('MediaSession handlers removed');
 		},
 
+		/**
+		 * Updates the MediaSession metadata (title, artist, album) so OS overlays
+		 * and lock-screen controls display the correct queue item information.
+		 *
+		 * @param {{ title: string, channel: string }} queueItem
+		 */
 		_updateMediaSessionMetadata(queueItem) {
 			if (!('mediaSession' in navigator)) return;
 			try {
@@ -790,41 +1216,13 @@
 			}
 		},
 
-		_ensurePlaying(video) {
-			if (!this._playing || this._userPaused || video.ended || Storage.paused) return;
-			if (!video.paused && video.readyState >= 3) return;
-
-			let attempts = 0;
-			const abort = () => {
-				clearTimeout(this._ensurePlayingTimer);
-				this._ensurePlayingTimer = null;
-				video.removeEventListener('play', abort);
-			};
-			video.addEventListener('play', abort, {
-				once: true
-			});
-
-			const attempt = () => {
-				if (!this._playing || this._userPaused || video.ended || Storage.paused) {
-					abort();
-					return;
-				}
-				if (!video.paused && video.readyState >= 3) {
-					abort();
-					return;
-				}
-				if (attempts >= ENSURE_PLAYING_ATTEMPTS) {
-					abort();
-					UI.showStatus('Could not auto-start — click play manually');
-					return;
-				}
-				attempts++;
-				this._clickPlayButton();
-				this._ensurePlayingTimer = setTimeout(attempt, ENSURE_PLAYING_DELAY_MS);
-			};
-			attempt();
-		},
-
+		/**
+		 * Attempts to start playback through several fallback strategies:
+		 *  1. Click the large overlay play button (shown on cued videos).
+		 *  2. Click the toolbar play button (if not already playing).
+		 *  3. Dispatch a synthetic 'k' keydown on the player element (YouTube's
+		 *     play/pause keyboard shortcut).
+		 */
 		_clickPlayButton() {
 			const overlay = document.querySelector(SEL.PLAY_OVERLAY);
 			if (overlay) {
@@ -849,16 +1247,40 @@
 	// ─────────────────────────────────────────────
 	// THUMBNAIL INJECTOR
 	// ─────────────────────────────────────────────
+
+	/**
+	 * Injects a circular action button onto every video thumbnail across all
+	 * YouTube listing pages (home, search, sidebar, end-of-video wall).
+	 *
+	 * Button states (stored on btn._ytqmState):
+	 *  idle    — green "+"; video is not in queue
+	 *  added   — green checkmark flash after left-clicking to add
+	 *  dupe    — red "x"; video is already in queue (left-click removes)
+	 *  removed — red "-" flash after left-clicking to remove
+	 *  next    — blue skip icon flash after right-clicking to insert as next
+	 *
+	 * Left-click  → toggle add/remove from queue
+	 * Right-click → insert as "play next" (second position when playing)
+	 *
+	 * The _cards Map stores per-card state including the hide timer that fades
+	 * the button when the cursor leaves the card.
+	 */
 	const ThumbnailInjector = {
 		_observer: null,
 		_pruneTimer: null,
 		// Map<cardElement, { btn, tooltip, hideTimer, videoUrl }>
 		_cards: new Map(),
 
+		/** Starts the injector: injects into existing cards, begins observing new ones. */
 		start() {
 			this._injectAll();
+			// Retry after short delays for cards that were in the DOM but not yet
+			// fully rendered when the script first ran.
+			setTimeout(() => this._injectAll(), 800);
+			setTimeout(() => this._injectAll(), 2000);
 			this._observe();
 			this._startHoverTracking();
+			// Periodically prune the _cards map of entries whose DOM nodes are gone.
 			this._pruneTimer = setInterval(() => {
 				this._cards.forEach((entry, card) => {
 					if (!document.contains(card)) {
@@ -869,6 +1291,7 @@
 			}, THUMBNAIL_PRUNE_MS);
 		},
 
+		/** Disconnects the observer and cleans up all card state. */
 		stop() {
 			if (this._observer) {
 				this._observer.disconnect();
@@ -884,9 +1307,12 @@
 			this._cards.clear();
 		},
 
-		// ── Public: re-evaluate every tracked button against the current queue.
-		// Called after any queue mutation (add, remove, reorder, advance) so that
-		// buttons reflect reality without requiring the user to move the mouse.
+		/**
+		 * Re-evaluates every tracked button against the current queue state.
+		 *
+		 * Called after any queue mutation so buttons reflect reality without
+		 * requiring the user to move the mouse over a card.
+		 */
 		syncAllButtons() {
 			const queue = Storage.queue;
 			this._cards.forEach((entry) => {
@@ -895,12 +1321,19 @@
 				if (inQueue && currentState !== 'dupe') {
 					this._applyState(entry, 'dupe');
 				} else if (!inQueue && currentState === 'dupe') {
-					// If the button isn't being hovered it should fade back to idle.
+					// Video was removed; revert to idle (hidden) state.
 					this._applyState(entry, 'idle');
 				}
 			});
 		},
 
+		/**
+		 * Delegates card hover tracking to the document level via event delegation.
+		 * This avoids attaching per-card listeners and handles dynamically added cards.
+		 *
+		 * mouseenter → show the button
+		 * mouseleave → schedule fade-out via hideTimer (cancelled if re-entered)
+		 */
 		_startHoverTracking() {
 			document.addEventListener('mouseenter', e => {
 				const card = e.target.closest?.(SEL.CARD) || e.target.closest?.('.ytp-suggestion-set');
@@ -916,6 +1349,7 @@
 			document.addEventListener('mouseleave', e => {
 				const card = e.target.closest?.(SEL.CARD) || e.target.closest?.('.ytp-suggestion-set');
 				if (!card) return;
+				// Ignore if the cursor moved to a child element of the same card.
 				const rel = e.relatedTarget;
 				if (rel?.closest?.(SEL.CARD) === card || rel?.closest?.('.ytp-suggestion-set') === card) return;
 				const entry = this._cards.get(card);
@@ -929,20 +1363,21 @@
 			}, true);
 		},
 
+		/** Sets up a MutationObserver on the main content area to catch newly
+		 *  rendered thumbnail anchors and inject buttons into them immediately. */
 		_observe() {
 			this._observer = new MutationObserver(mutations => {
 				for (const m of mutations) {
 					m.addedNodes.forEach(node => {
 						if (node.nodeType !== Node.ELEMENT_NODE) return;
-						// Check if the node itself is a watch-page anchor.
 						this._tryInjectAnchor(node);
-						// Check all descendant anchors within the added subtree.
 						node.querySelectorAll('a[href*="/watch?v="]').forEach(a => this._tryInjectAnchor(a));
 						node.querySelectorAll(SEL.VIDEOWALL_ANCHOR).forEach(a => this._tryInjectVideowall(a));
 					});
 				}
 			});
-			const roots = document.querySelectorAll(SEL.THUMB_OBSERVER_ROOTS);
+			// Attach to the first matching root; fall back to <body> if none found.
+			const roots = [...document.querySelectorAll(SEL.THUMB_OBSERVER_ROOTS)];
 			const target = roots.length ? roots[0] : document.body;
 			this._observer.observe(target, {
 				childList: true,
@@ -950,19 +1385,27 @@
 			});
 		},
 
+		/**
+		 * Injects a button into a standard (non-videowall) anchor if it contains
+		 * an image and doesn't already have a button.
+		 */
 		_tryInjectAnchor(node) {
 			if (node.nodeType !== Node.ELEMENT_NODE) return;
-			// Node is itself a qualifying anchor.
-			if (node.matches('a[href*="/watch?v="]') && node.querySelector('img') && !node.querySelector('.ytqm-thumb-add-btn')) {
+			if (
+				node.matches('a[href*="/watch?v="]') &&
+				node.querySelector('img') &&
+				!node.querySelector('.ytqm-thumb-add-btn')
+			) {
 				this._injectButton(node, false);
-				return;
 			}
 		},
 
+		/** Injects a button into a videowall (end-of-video suggestions) anchor. */
 		_tryInjectVideowall(anchor) {
 			if (!anchor.querySelector('.ytqm-thumb-add-btn')) this._injectButton(anchor, true);
 		},
 
+		/** Scans the entire document and injects buttons into all matching anchors. */
 		_injectAll() {
 			document.querySelectorAll('a[href*="/watch?v="]').forEach(anchor => {
 				if (!anchor.querySelector('img')) return;
@@ -975,6 +1418,19 @@
 			});
 		},
 
+		/**
+		 * Extracts the video title and channel name from a card element.
+		 *
+		 * For standard cards, multiple selector candidates are tried in priority
+		 * order until a non-empty string is found.
+		 * For videowall anchors, dedicated child elements are queried first, with
+		 * the aria-label as a fallback (with the duration suffix stripped).
+		 *
+		 * @param  {Element} anchor
+		 * @param  {Element} card
+		 * @param  {boolean} isVideowall
+		 * @returns {{ title: string, channel: string }}
+		 */
 		_extractVideoMeta(anchor, card, isVideowall) {
 			let title = '',
 				channel = '';
@@ -982,6 +1438,7 @@
 				title = anchor.querySelector('.ytp-modern-videowall-still-info-title')?.textContent?.trim() || '';
 				channel = anchor.querySelector('.ytp-modern-videowall-still-info-author')?.textContent?.trim() || '';
 				if (!title) {
+					// Fall back to aria-label, stripping trailing duration text like "3 minutes, 41 seconds".
 					const aria = anchor.getAttribute('aria-label') || '';
 					title = aria.replace(/\s+\d[\d:, ]*(seconds?|minutes?|hours?)[^)]*$/i, '').trim();
 				}
@@ -1011,8 +1468,16 @@
 			};
 		},
 
-		// ── Apply a named visual state to a button+tooltip pair.
-		// Extracted from _injectButton so syncAllButtons can reuse it.
+		/**
+		 * Applies a named visual state to a button+tooltip pair.
+		 * Extracted from _injectButton so syncAllButtons() can reuse it.
+		 *
+		 * States: 'idle' | 'added' | 'dupe' | 'removed' | 'next'
+		 *
+		 * @param {{ btn: HTMLElement, tooltip: HTMLElement }} entry
+		 * @param {string}      state
+		 * @param {number|null} resetAfterMs  - if set, auto-reverts to 'idle' after this many ms
+		 */
 		_applyState(entry, state, resetAfterMs = null) {
 			const {
 				btn,
@@ -1022,6 +1487,8 @@
 			clearTimeout(btn._ytqmResetTimer);
 			btn._ytqmResetTimer = null;
 
+			// Helper that updates only the text node (first child) of the button,
+			// leaving the tooltip element untouched.
 			const setText = t => {
 				if (btn.childNodes[0]?.nodeType === Node.TEXT_NODE) btn.childNodes[0].nodeValue = t;
 			};
@@ -1031,35 +1498,35 @@
 					btn.style.background = `rgba(${THUMB_BTN_GREEN_RGB},${THUMB_BTN_OPACITY})`;
 					btn.style.opacity = '0';
 					btn.style.transform = 'translateY(-4px)';
-					setText('\u002b');
+					setText('\u002b'); // "+"
 					tooltip.textContent = 'Add to Queue';
 					break;
 				case 'added':
 					btn.style.background = `rgba(${THUMB_BTN_GREEN_RGB},${THUMB_BTN_OPACITY})`;
 					btn.style.opacity = '1';
 					btn.style.transform = 'translateY(0)';
-					setText('\u2713');
+					setText('\u2713'); // checkmark
 					tooltip.textContent = 'Added!';
 					break;
 				case 'dupe':
 					btn.style.background = `rgba(${THUMB_BTN_RED_RGB},${THUMB_BTN_OPACITY})`;
 					btn.style.opacity = '0';
 					btn.style.transform = 'translateY(-4px)';
-					setText('\u2715');
+					setText('\u2715'); // "x"
 					tooltip.textContent = 'In queue — click to remove';
 					break;
 				case 'removed':
 					btn.style.background = `rgba(${THUMB_BTN_RED_RGB},${THUMB_BTN_OPACITY})`;
 					btn.style.opacity = '1';
 					btn.style.transform = 'translateY(0)';
-					setText('\u2212');
+					setText('\u2212'); // minus
 					tooltip.textContent = 'Removed from queue';
 					break;
 				case 'next':
 					btn.style.background = `rgba(${THUMB_BTN_BLUE_RGB},${THUMB_BTN_OPACITY})`;
 					btn.style.opacity = '1';
 					btn.style.transform = 'translateY(0)';
-					setText('\u23ed');
+					setText('\u23ed'); // skip-to-next icon
 					tooltip.textContent = 'Playing next!';
 					break;
 			}
@@ -1068,6 +1535,12 @@
 			}
 		},
 
+		/**
+		 * Creates and appends the circular overlay button to a thumbnail anchor.
+		 *
+		 * @param {Element} anchor      - the <a> tag wrapping the thumbnail
+		 * @param {boolean} isVideowall - true when injecting into end-of-video suggestions
+		 */
 		_injectButton(anchor, isVideowall = false) {
 			let videoId, videoUrl;
 			try {
@@ -1079,9 +1552,11 @@
 				return;
 			}
 
+			// Make the anchor a positioning context for the absolutely-placed button.
 			anchor.style.position = 'relative';
 			const card = isVideowall ? anchor : (anchor.closest(SEL.CARD) || anchor);
 
+			// ── Build button element ────────────────────────────────────────────
 			const btn = document.createElement('button');
 			btn.className = 'ytqm-thumb-add-btn';
 			btn._ytqmState = 'idle';
@@ -1111,8 +1586,9 @@
 				transform: 'translateY(-4px)',
 				transition: 'opacity 0.25s ease, transform 0.25s ease, background 0.2s ease',
 			});
-			btn.textContent = '\u002b';
+			btn.textContent = '\u002b'; // "+"
 
+			// ── Build tooltip ────────────────────────────────────────────────────
 			const tooltip = document.createElement('div');
 			Object.assign(tooltip.style, {
 				position: 'absolute',
@@ -1142,8 +1618,8 @@
 				tooltip.style.opacity = '0';
 			});
 
-			// The entry object is created before event listeners so _applyState
-			// can be called inside them without a forward reference.
+			// The entry is created before click handlers so _applyState can be
+			// called inside them without a forward reference issue.
 			const entry = {
 				btn,
 				tooltip,
@@ -1156,17 +1632,17 @@
 				this._applyState(entry, 'dupe');
 			}
 
+			// ── Left-click: toggle add/remove ───────────────────────────────────
 			btn.addEventListener('click', e => {
 				e.preventDefault();
 				e.stopPropagation();
 
 				if (btn._ytqmState === 'dupe') {
-					// Left-click on a queued video → remove it.
 					Storage.removeVideoByUrl(videoUrl);
 					UI.updateControls();
 					if (UI.panelOpen) UI.refreshPanel();
 					this._applyState(entry, 'removed', BTN_TEMP_TEXT_DURATION_MS);
-					// After the flash, sync with real queue state in case it was
+					// After the flash completes, re-sync in case the video was
 					// re-added by another mechanism during the timeout.
 					setTimeout(() => this.syncAllButtons(), BTN_TEMP_TEXT_DURATION_MS + 50);
 					return;
@@ -1181,12 +1657,14 @@
 					this._applyState(entry, 'added', BTN_TEMP_TEXT_DURATION_MS);
 					setTimeout(() => this.syncAllButtons(), BTN_TEMP_TEXT_DURATION_MS + 50);
 				} else {
+					// addVideo returned false: already in queue (race with another tab).
 					this._applyState(entry, 'dupe');
 				}
 				UI.updateControls();
 				if (UI.panelOpen) UI.refreshPanel();
 			});
 
+			// ── Right-click: insert as "play next" ──────────────────────────────
 			btn.addEventListener('contextmenu', e => {
 				e.preventDefault();
 				e.stopPropagation();
@@ -1195,11 +1673,10 @@
 					title,
 					channel
 				} = this._extractVideoMeta(anchor, card, isVideowall);
+				// When playing, index 0 is the currently playing video so "next" is index 1.
 				const insertAt = Player._playing && Storage.queue.length > 0 ? 1 : 0;
 				Storage.insertNext(videoUrl, title, channel, insertAt);
 				this._applyState(entry, 'next', BTN_TEMP_TEXT_DURATION_MS);
-				// Re-sync after flash so the button settles into the correct
-				// queued / not-queued visual state.
 				setTimeout(() => this.syncAllButtons(), BTN_TEMP_TEXT_DURATION_MS + 50);
 				UI.updateControls();
 				if (UI.panelOpen) UI.refreshPanel();
@@ -1213,6 +1690,17 @@
 	// ─────────────────────────────────────────────
 	// UI MODULE
 	// ─────────────────────────────────────────────
+
+	/**
+	 * Builds and manages the entire injected UI:
+	 *  - A fixed button bar (bottom-left) with: Queue | Play Queue | Add to Queue
+	 *  - A sliding queue panel listing all queued videos with drag-to-reorder
+	 *  - A settings modal accessible from the panel header
+	 *  - A status pill for transient notifications
+	 *
+	 * Everything lives inside a Shadow DOM (#ytqm-host) so YouTube's own
+	 * stylesheets cannot interfere with the injected elements.
+	 */
 	const UI = {
 		host: null,
 		shadow: null,
@@ -1227,21 +1715,24 @@
 		list: null,
 		settingsOverlay: null,
 		panelOpen: false,
-		_dragSrcIndex: null,
+		_dragSrcIndex: null, // Index of the item currently being dragged in the queue panel
 		addBtnFlash: null,
 		addBtnLabel: null,
 		_addBtnFlashTimer: null,
 
+		/** Creates the Shadow DOM host and all child UI elements, then mounts to document.body. */
 		init() {
+			// Remove any stale instance (e.g. after a partial re-injection).
 			document.getElementById('ytqm-host')?.remove();
 
 			this.host = document.createElement('div');
 			this.host.id = 'ytqm-host';
+			// Zero-size fixed host; actual UI is positioned fixed inside the shadow root.
 			Object.assign(this.host.style, {
 				position: 'fixed',
 				bottom: '0',
 				left: '0',
-				zIndex: '2147483647',
+				zIndex: '100',
 				pointerEvents: 'none',
 				width: '0',
 				height: '0',
@@ -1262,13 +1753,26 @@
 			this._buildButtons();
 			document.body.appendChild(this.host);
 
+			// Close the panel when clicking outside the host element.
 			document.addEventListener('mousedown', e => {
 				if (!this.panelOpen) return;
 				if (!e.composedPath().some(el => el === this.host)) this.togglePanel(false);
 			});
 
+			// Hide UI while browser is in fullscreen — YouTube's fullscreen layer lives
+			// outside the normal stacking context so z-index cannot place our UI behind it.
+			const onFullscreenChange = () => {
+				const isFullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement);
+				this.host.style.visibility = isFullscreen ? 'hidden' : 'visible';
+			};
+			document.addEventListener('fullscreenchange', onFullscreenChange);
+			document.addEventListener('webkitfullscreenchange', onFullscreenChange);
+
 			this.updateControls();
 		},
+
+		// ── CSS helpers ─────────────────────────────────────────────────────────
+		// CSS is split into focused helpers for maintainability.
 
 		_cssReset() {
 			return `* { box-sizing: border-box; margin: 0; padding: 0; }`;
@@ -1480,6 +1984,7 @@
       `;
 		},
 
+		/** Concatenates all CSS helper strings into the single Shadow DOM <style> block. */
 		_css() {
 			return [
 				this._cssReset(),
@@ -1494,16 +1999,19 @@
 			].join('\n');
 		},
 
+		/** Builds the fixed button bar: Queue | Play Queue | Add to Queue */
 		_buildButtons() {
 			this.addBtn = this._makeBtn('ytqm-add-btn', '', () => this._onAddClick());
 			this.queueToggleBtn = this._makeBtn('ytqm-queue-toggle', '\u2261 Queue', () => this.togglePanel());
 			this.playBtn = this._makeBtn('ytqm-play-btn', '\u25b6 Play Queue', () => this._onPlayClick());
 			this.addBtn.addEventListener('contextmenu', e => this._onAddContextMenu(e));
 
+			// The label span sits inside addBtn so the flash overlay can cover it.
 			this.addBtnLabel = document.createElement('span');
 			this.addBtnLabel.textContent = '\uff0b Add to Queue';
 			this.addBtn.appendChild(this.addBtnLabel);
 
+			// Overlay div that fades in with the "Added!" / "Removed!" feedback.
 			this.addBtnFlash = document.createElement('div');
 			this.addBtnFlash.id = 'ytqm-add-btn-flash';
 			this.addBtn.appendChild(this.addBtnFlash);
@@ -1513,6 +2021,14 @@
 			this.root.appendChild(this.addBtn);
 		},
 
+		/**
+		 * Factory for a generic pill button inside the Shadow DOM.
+		 *
+		 * @param {string}   id      - element ID
+		 * @param {string}   label   - initial text content
+		 * @param {Function} onClick - click handler
+		 * @returns {HTMLButtonElement}
+		 */
 		_makeBtn(id, label, onClick) {
 			const btn = document.createElement('button');
 			btn.className = 'ytqm-btn';
@@ -1525,6 +2041,7 @@
 			return btn;
 		},
 
+		/** Builds the sliding queue panel and appends it to the Shadow DOM. */
 		_buildPanel() {
 			this.panel = document.createElement('div');
 			this.panel.id = 'ytqm-panel';
@@ -1532,6 +2049,7 @@
 			const header = document.createElement('div');
 			header.id = 'ytqm-panel-header';
 
+			// Clicking the "Queue" title text opens the settings modal.
 			const title = document.createElement('span');
 			title.id = 'ytqm-panel-title';
 			title.textContent = 'Queue';
@@ -1544,6 +2062,7 @@
 			const controls = document.createElement('div');
 			controls.className = 'header-controls';
 
+			// Remote pause/resume button — only visible when a tab is playing.
 			this.remotePauseBtn = document.createElement('button');
 			this.remotePauseBtn.id = 'ytqm-remote-pause-btn';
 			this.remotePauseBtn.textContent = '\u23f8 Pause';
@@ -1578,9 +2097,19 @@
 			this._buildSettingsModal();
 		},
 
+		/**
+		 * Builds the settings modal overlay and appends it to the Shadow DOM.
+		 *
+		 * Each setting definition in `defs` produces either a toggle switch
+		 * (boolean settings) or a number input (interval settings).
+		 *
+		 * Settings are re-read from Storage each time openSettings() is called
+		 * so the UI always reflects the persisted values.
+		 */
 		_buildSettingsModal() {
 			this.settingsOverlay = document.createElement('div');
 			this.settingsOverlay.id = 'ytqm-settings-overlay';
+			// Close when clicking the dark backdrop (but not the modal card itself).
 			this.settingsOverlay.addEventListener('mousedown', e => {
 				if (e.target === this.settingsOverlay) this.closeSettings();
 			});
@@ -1601,6 +2130,7 @@
 			const body = document.createElement('div');
 			body.id = 'ytqm-settings-body';
 
+			/** Setting definitions — each object produces one row in the modal. */
 			const defs = [{
 					key: 'remoteControls',
 					label: 'Cross-tab controls',
@@ -1610,6 +2140,11 @@
 					key: 'theaterMode',
 					label: 'Auto theater mode',
 					sub: 'Switch to theater mode when the browser window is narrower than 60 % of your screen width, and back when it widens. Useful when sharing the screen with another app.',
+				},
+				{
+					key: 'restartFromBeginning',
+					label: 'Always restart from beginning',
+					sub: 'Seek to 0:00 whenever the queue navigates to a video, including ones that may have partial watch progress saved by YouTube.',
 				},
 				{
 					key: 'blockContextMenu',
@@ -1680,9 +2215,11 @@
 						control.value = v;
 						Settings.set(def.key, v);
 						log(`Setting changed: ${def.key} =`, v);
+						// Restart MediaSession refresh with the new interval if currently playing.
 						if (Player._playing) Player._registerMediaSession();
 					});
 				} else {
+					// Toggle switch: <span.ytqm-toggle> wrapping a hidden checkbox + visible track + thumb.
 					const toggle = document.createElement('span');
 					toggle.className = 'ytqm-toggle';
 
@@ -1718,6 +2255,7 @@
 			this.shadow.appendChild(this.settingsOverlay);
 		},
 
+		/** Opens the settings modal, refreshing all control values from storage first. */
 		openSettings() {
 			this.settingsOverlay.querySelectorAll('input[type="checkbox"]').forEach(input => {
 				input.checked = Settings.get()[input._ytqmSettingKey];
@@ -1732,6 +2270,12 @@
 			this.settingsOverlay.classList.remove('open');
 		},
 
+		/**
+		 * Reads the current watch page's video ID, title, and channel from the DOM.
+		 * Returns null when not on a watch page.
+		 *
+		 * @returns {{ url: string, title: string, channel: string } | null}
+		 */
 		_currentVideoMeta() {
 			const videoId = new URLSearchParams(location.search).get('v');
 			if (!videoId) return null;
@@ -1748,6 +2292,12 @@
 			};
 		},
 
+		/**
+		 * Shows a brief animated feedback label over the "Add to Queue" button.
+		 *
+		 * @param {string} label  - text to display (e.g. "Added to Queue")
+		 * @param {string} bg     - background colour string for the flash overlay
+		 */
 		_flashAddBtn(label, bg) {
 			clearTimeout(this._addBtnFlashTimer);
 			this.addBtnFlash.textContent = label;
@@ -1759,6 +2309,7 @@
 			}, BTN_FLASH_DURATION_MS);
 		},
 
+		/** Handles left-click on the "Add to Queue" button: toggles the current video in/out. */
 		_onAddClick() {
 			try {
 				const meta = this._currentVideoMeta();
@@ -1783,6 +2334,7 @@
 			}
 		},
 
+		/** Handles right-click on the "Add to Queue" button: inserts current video as "play next". */
 		_onAddContextMenu(e) {
 			e.preventDefault();
 			e.stopPropagation();
@@ -1799,6 +2351,7 @@
 			}
 		},
 
+		/** Handles click on "Play Queue" / "Stop Queue". */
 		_onPlayClick() {
 			if (Player._playing) {
 				Player.stop();
@@ -1813,11 +2366,18 @@
 			this.updateControls();
 		},
 
+		/** Handles click on the remote pause/resume button in the panel header. */
 		_onRemotePauseClick() {
 			if (Storage.paused) Player.remoteResume();
 			else Player.remotePause();
 		},
 
+		/**
+		 * Temporarily replaces a button's text content with feedback text, then restores it.
+		 *
+		 * @param {HTMLButtonElement} btn
+		 * @param {string}            tempText
+		 */
 		flashBtn(btn, tempText) {
 			const original = btn.textContent;
 			btn.textContent = tempText;
@@ -1826,6 +2386,15 @@
 			}, BTN_TEMP_TEXT_DURATION_MS);
 		},
 
+		/**
+		 * Displays a transient notification pill above the button bar.
+		 *
+		 * The pill is created lazily on first call and reused thereafter.
+		 * Each call resets the auto-hide timer.
+		 *
+		 * @param {string} msg
+		 * @param {number} [durationMs] - how long to show before fading out
+		 */
 		showStatus(msg, durationMs = STATUS_DEFAULT_DURATION_MS) {
 			if (!this.shadow) return;
 			let pill = this.shadow.getElementById('ytqm-status');
@@ -1858,6 +2427,10 @@
 			}, durationMs);
 		},
 
+		/**
+		 * Syncs all button bar controls to reflect the current application state.
+		 * Should be called after any queue mutation or playback state change.
+		 */
 		updateControls() {
 			if (!this.addBtn) return;
 
@@ -1867,6 +2440,7 @@
 
 			this.queueToggleBtn.textContent = count > 0 ? `\u2261 Queue (${count})` : '\u2261 Queue';
 
+			// Show/update the "Add to Queue" button only on watch pages.
 			const currentUrl = isWatch ?
 				`https://www.youtube.com/watch?v=${new URLSearchParams(location.search).get('v')}` :
 				null;
@@ -1885,6 +2459,10 @@
 			this.updateRemotePauseBtn();
 		},
 
+		/**
+		 * Updates the cross-tab control buttons (pause, skip, prev) visibility and
+		 * labels based on current playing/paused state and the remoteControls setting.
+		 */
 		updateRemotePauseBtn() {
 			if (!this.remotePauseBtn) return;
 
@@ -1898,7 +2476,10 @@
 
 				this.remotePauseBtn.style.display = 'inline-block';
 				this.remotePauseBtn.textContent = isPaused ? '\u25b6 Resume' : '\u23f8 Pause';
-				isPaused ? this.remotePauseBtn.classList.add('is-paused') : this.remotePauseBtn.classList.remove('is-paused');
+				isPaused ?
+					this.remotePauseBtn.classList.add('is-paused') :
+					this.remotePauseBtn.classList.remove('is-paused');
+				// Only show prev/skip when there is actually somewhere to go.
 				if (this.prevBtn) this.prevBtn.style.display = hasHistory ? '' : 'none';
 				if (this.skipBtn) this.skipBtn.style.display = hasNext ? '' : 'none';
 			} else {
@@ -1908,16 +2489,36 @@
 			}
 		},
 
+		/**
+		 * Opens or closes the queue panel.
+		 *
+		 * @param {boolean} [force] - if provided, explicitly sets the open state;
+		 *                            otherwise toggles the current state.
+		 */
 		togglePanel(force) {
 			this.panelOpen = force !== undefined ? force : !this.panelOpen;
 			if (this.panelOpen) {
 				this.refreshPanel();
 				this.panel.classList.add('open');
-			} else this.panel.classList.remove('open');
+			} else {
+				this.panel.classList.remove('open');
+			}
 			const pill = this.shadow?.getElementById('ytqm-status');
 			if (pill) pill.classList.toggle('panel-open', this.panelOpen);
 		},
 
+		/**
+		 * Rebuilds the queue list DOM from the current Storage.queue state.
+		 *
+		 * Each item is rendered with:
+		 *  - A numeric index label (replaced with a play icon for the currently playing item)
+		 *  - The video title (truncated with ellipsis)
+		 *  - A remove button
+		 *  - Drag-and-drop listeners (disabled for the locked first item when playing)
+		 *
+		 * Index 0 is "locked" when the queue is playing to prevent accidentally
+		 * reordering the currently playing video out of position.
+		 */
 		refreshPanel() {
 			if (!this.list) return;
 			const queue = Storage.queue;
@@ -1951,11 +2552,12 @@
 				titleEl.textContent = video.title;
 				titleEl.title = video.title;
 
+				// Highlight the currently playing item with bold text and a play indicator.
 				try {
 					const vid = new URL(video.url, location.origin).searchParams.get('v');
 					if (currentId && vid === currentId && Player._playing) {
 						titleEl.classList.add('is-current');
-						idxLabel.textContent = '\u25b6';
+						idxLabel.textContent = '\u25b6'; // Replace "1" with a play icon
 					}
 				} catch {}
 
@@ -1971,6 +2573,8 @@
 
 				item.append(idxLabel, titleEl, removeBtn);
 
+				// Drag-and-drop: the locked first item (currently playing) is neither
+				// draggable nor a valid drop target.
 				if (!isLocked) {
 					item.addEventListener('dragstart', e => {
 						this._dragSrcIndex = index;
@@ -2010,6 +2614,14 @@
 	// ─────────────────────────────────────────────
 	// CONTEXT MENU BLOCKER
 	// ─────────────────────────────────────────────
+
+	/**
+	 * Optionally suppresses the browser's native context menu across all of YouTube.
+	 *
+	 * This is needed because right-clicking a thumbnail overlay button should always
+	 * trigger "insert as next" without the OS/browser context menu appearing on top.
+	 * The setting can be disabled for users who rely on the context menu elsewhere.
+	 */
 	const ContextMenuBlocker = {
 		_initialised: false,
 
@@ -2032,6 +2644,14 @@
 	// them and keeps hiding newly-rendered ones automatically.
 	// Legacy ytd-* selectors are kept as fallbacks for older YouTube layouts.
 	// ─────────────────────────────────────────────
+
+	/**
+	 * Optionally hides YouTube's native thumbnail hover buttons (Watch Later,
+	 * Add to Queue) by injecting a global <style> into document.head.
+	 *
+	 * Using a stylesheet rather than DOM removal means the hiding persists
+	 * automatically as YouTube renders new thumbnails via its SPA router.
+	 */
 	const NativeButtonHider = {
 		_styleEl: null,
 
@@ -2041,6 +2661,7 @@
 			'ytd-thumbnail-overlay-buttons-renderer',
 		].map(s => `${s}{display:none!important}`).join(''),
 
+		/** Adds or removes the hiding stylesheet based on the current setting. */
 		apply() {
 			const shouldHide = Settings.get().hideNativeButtons;
 			if (shouldHide && !this._styleEl) {
@@ -2060,13 +2681,17 @@
 	// ─────────────────────────────────────────────
 	// URL CHANGE DETECTION
 	// ─────────────────────────────────────────────
+
+	/** Tracks the last seen href so URL-change handlers are not fired redundantly. */
 	let lastUrl = location.href;
 
+	/** Called when the URL has definitively changed; notifies relevant modules. */
 	function notifyUrlChange(newHref) {
 		lastUrl = newHref;
 		onUrlChange();
 	}
 
+	/** Handles any URL change event regardless of whether the actual href changed. */
 	function onUrlChange() {
 		log('URL changed to', location.href);
 		UI.updateControls();
@@ -2075,21 +2700,26 @@
 		ThumbnailInjector.syncAllButtons();
 	}
 
-	// Handle back/forward browser navigation
+	// popstate fires on browser back/forward navigation; allow a brief settle before reacting
+	// to avoid a race with yt-navigate-finish which may fire immediately after.
 	window.addEventListener('popstate', () => {
 		setTimeout(() => {
 			if (location.href !== lastUrl) notifyUrlChange(location.href);
 		}, URL_CHANGE_SETTLE_MS);
 	});
 
-	// yt-navigate-finish is the single source of truth for all YouTube SPA navigation
+	/**
+	 * yt-navigate-finish is YouTube's SPA equivalent of DOMContentLoaded.
+	 * It fires after every in-app navigation (link clicks, back/forward via YouTube's
+	 * own history, etc.) and is the most reliable signal that the new page DOM is ready.
+	 */
 	window.addEventListener('yt-navigate-finish', () => {
 		if (location.href !== lastUrl) notifyUrlChange(location.href);
 		else onUrlChange();
 
-		// Only attach if we initiated the navigation (queue is playing)
-		// _waitForVideoAndPlay polls until the correct video ID is in the URL,
-		// so calling it here is safe even if this fires for unrelated navigations
+		// If the queue is playing, re-attach to the (possibly new) <video> element.
+		// _waitForVideoAndPlay guards against unrelated navigations by verifying
+		// that the URL matches the expected video ID before attaching.
 		if (Player._playing) {
 			log('yt-navigate-finish: attaching to video');
 			setTimeout(() => Player._waitForVideoAndPlay(), 300);
@@ -2099,10 +2729,29 @@
 	// ─────────────────────────────────────────────
 	// THEATER MODE MODULE
 	// ─────────────────────────────────────────────
+
+	/**
+	 * Optionally toggles YouTube's theater mode based on window width.
+	 *
+	 * When enabled, theater mode is activated when the window is narrower than
+	 * THEATER_MIN_WIDTH_RATIO (60%) of the screen width — useful when the browser
+	 * is side-by-side with another app. Theater mode is deactivated when the window
+	 * widens back past the threshold.
+	 *
+	 * Checks are debounced to avoid rapid toggling during resize operations.
+	 * Only fires when the window has focus or becomes visible, as YouTube's theater
+	 * button may not respond when the tab is in the background.
+	 */
 	const TheaterMode = {
 		_initialised: false,
 		_debounceTimer: null,
 
+		/**
+		 * Locates the theater-mode toggle button using multiple selector strategies
+		 * to handle YouTube's occasional DOM restructuring.
+		 *
+		 * @returns {HTMLElement|undefined}
+		 */
 		_findTheaterButton() {
 			return (
 				document.querySelector(SEL.THEATER_BTN_DATA) ||
@@ -2111,10 +2760,16 @@
 			);
 		},
 
+		/** Returns true if the watch page is currently in theater mode. */
 		_isTheaterMode() {
 			return document.querySelector(SEL.WATCH_FLEXY)?.hasAttribute('theater') ?? false;
 		},
 
+		/**
+		 * Injects a <style> that forces subtitle text to white.
+		 * YouTube's theater mode can render captions with poor contrast in some themes;
+		 * this is a minimal targeted fix that avoids overriding YouTube's own styling.
+		 */
 		_injectCaptionStyle() {
 			if (document.getElementById('ytrs-caption-style')) return;
 			const style = document.createElement('style');
@@ -2123,10 +2778,16 @@
 			document.head.appendChild(style);
 		},
 
+		/**
+		 * Evaluates whether theater mode should be toggled and does so if needed.
+		 * No-op when the setting is disabled, the window lacks focus, or we're not
+		 * on a watch page.
+		 */
 		check() {
 			if (!Settings.get().theaterMode) return;
 			if (!document.hasFocus()) return;
 			if (!Page.isWatchPage()) return;
+			if (document.fullscreenElement || document.webkitFullscreenElement) return; // ← ADD THIS
 
 			const isNarrow = window.innerWidth < window.screen.width * THEATER_MIN_WIDTH_RATIO;
 			const inTheater = this._isTheaterMode();
@@ -2145,6 +2806,12 @@
 			this._debounceTimer = setTimeout(fn, delay);
 		},
 
+		/**
+		 * Initialises the theater mode module.
+		 * If already initialised, simply re-runs check() to sync with current state.
+		 * Otherwise attaches resize / focus / visibilitychange listeners and runs
+		 * an initial check.
+		 */
 		init() {
 			this._injectCaptionStyle();
 			if (this._initialised) {
@@ -2169,6 +2836,19 @@
 	// ─────────────────────────────────────────────
 	// BOOT
 	// ─────────────────────────────────────────────
+
+	/**
+	 * Entry point.
+	 *
+	 * Defers until document.body exists (the script runs at document-start),
+	 * then:
+	 *  1. Verifies that localStorage is accessible (read + write + read-back check).
+	 *  2. Initialises all modules in dependency order.
+	 *
+	 * If localStorage is unavailable (private browsing on some browsers, restrictive
+	 * cookie settings, or sandboxed iframes), a visible error pill is shown and
+	 * the script exits early rather than silently failing.
+	 */
 	function tryInit() {
 		if (!document.body) {
 			setTimeout(tryInit, 100);
@@ -2176,6 +2856,9 @@
 		}
 		log('Initialising…');
 
+		// Verify localStorage is both writable and readable. Some environments
+		// provide a non-throwing but non-functional implementation, so a simple
+		// write + read-back check is more reliable than try/catch alone.
 		try {
 			localStorage.setItem('ytqm_test', '1');
 			if (localStorage.getItem('ytqm_test') !== '1') throw new Error('read-back mismatch');
@@ -2188,7 +2871,7 @@
 				position: 'fixed',
 				bottom: '24px',
 				left: '20px',
-				zIndex: '2147483647',
+				zIndex: '1',
 				background: '#c0392b',
 				color: '#fff',
 				padding: '8px 14px',
