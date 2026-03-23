@@ -3,7 +3,6 @@
 // @namespace https://github.com/Alpacinator/Youtube-Custom-Queue/
 // @version 1.1.1
 // @description A persistent, cross-tab YouTube queue manager with drag-to-reorder, auto-advance, and optional auto theater mode.
-// @author You
 // @match *://*.youtube.com/*
 // @grant none
 // @run-at document-start
