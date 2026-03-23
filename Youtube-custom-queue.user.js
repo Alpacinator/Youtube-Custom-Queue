@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name YouTube Queue Manager
 // @namespace https://github.com/Alpacinator/Youtube-Custom-Queue/
-// @version 1.1.1
+// @version 1.2.0
 // @description A persistent, cross-tab YouTube queue manager with drag-to-reorder, auto-advance, and optional auto theater mode.
 // @match *://*.youtube.com/*
 // @grant none
@@ -925,7 +925,7 @@
 		/**
 		 * Called once the target <video> element is confirmed ready.
 		 * Attaches event listeners, starts the end-poll, registers MediaSession,
-		 * updates the page title/channel, and begins playback.
+		 * and begins playback.
 		 *
 		 * Guards against re-entrancy with _attachedVideoId so that rapid
 		 * yt-navigate-finish events don't cause duplicate attachments.
@@ -946,25 +946,6 @@
 			this._scheduleEndPoll(video);
 			this._registerMediaSession();
 			this._updateMediaSessionMetadata(queueItem);
-
-			// Override the page title and visible channel so the OS media overlay
-			// and browser tab title reflect the queue item rather than YouTube's
-			// auto-generated data (which can lag or differ).
-			if (queueItem.title) {
-				document.title = `${queueItem.title} - YouTube`;
-				const h1 = document.querySelector(SEL.WATCH_TITLE);
-				if (h1) {
-					h1.textContent = queueItem.title;
-					h1.setAttribute('title', queueItem.title);
-				}
-			}
-			if (queueItem.channel) {
-				const el = document.querySelector(SEL.CHANNEL_NAME);
-				if (el) {
-					el.textContent = queueItem.channel;
-					el.setAttribute('title', queueItem.channel);
-				}
-			}
 
 			// Honour cross-tab or user pause state before trying to play.
 			if (this._userPaused || Storage.paused) return;
