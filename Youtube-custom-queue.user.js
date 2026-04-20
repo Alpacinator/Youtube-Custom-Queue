@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name YouTube Queue Manager
 // @namespace https://github.com/Alpacinator/Youtube-Custom-Queue/
-// @version 1.3.0
+// @version 1.4.0
 // @description A persistent, cross-tab YouTube queue manager with drag-to-reorder, auto-advance, and optional auto theater mode.
 // @match *://*.youtube.com/*
 // @grant none
@@ -93,7 +93,8 @@
 
 	const SEL = {
 		CARD: [
-			'.yt-lockup-view-model',
+			'yt-lockup-view-model',        // element tag (new YouTube layout)
+			'.yt-lockup-view-model',       // class fallback (older layout)
 			'ytd-rich-item-renderer',
 			'ytd-compact-video-renderer',
 			'ytd-video-renderer',
@@ -114,11 +115,15 @@
 		CHANNEL_NAME: '#channel-name yt-formatted-string#text, ytd-channel-name yt-formatted-string',
 		WATCH_FLEXY: 'ytd-watch-flexy',
 		THUMB_OBSERVER_ROOTS: 'ytd-app, #content, #primary, #secondary',
+		VIDEO_PREVIEW: 'ytd-video-preview',
 	};
 
 	const LOG_PREFIX = '[YT-Queue]';
 	function log(...args) { console.log(LOG_PREFIX, ...args); }
 	function warn(...args) { console.warn(LOG_PREFIX, ...args); }
+
+	/** Collision-safe ID: millisecond timestamp * 1000 + random 0-999 integer. */
+	function _uid() { return Date.now() * 1000 + (Math.random() * 1000 | 0); }
 
 	const TAB_ID = (() => {
 		let id = sessionStorage.getItem('ytqm_tab_id');
@@ -177,7 +182,7 @@
 		setPaused(val) { const s = this.load(); s.paused = val; this.save(s); },
 		pushHistory(video) {
 			const s = this.load();
-			s.history.push({ ...video, id: Date.now() });
+			s.history.push({ ...video, id: _uid() });
 			if (s.history.length > HISTORY_MAX) s.history.shift();
 			this.save(s);
 			log('History push:', video.title, '— depth:', s.history.length);
@@ -191,7 +196,7 @@
 		addVideo(url, title, channel = '') {
 			const s = this.load();
 			if (s.queue.find(v => v.url === url)) { log('Already in queue:', url); return false; }
-			s.queue.push({ url, title, channel, id: Date.now() });
+			s.queue.push({ url, title, channel, id: _uid() });
 			this.save(s);
 			log('Added to queue:', title);
 			return true;
@@ -216,7 +221,7 @@
 		insertNext(url, title, channel = '', insertAt = 0) {
 			const s = this.load();
 			s.queue = s.queue.filter(v => v.url !== url);
-			s.queue.splice(insertAt, 0, { url, title, channel, id: Date.now() });
+			s.queue.splice(insertAt, 0, { url, title, channel, id: _uid() });
 			this.save(s);
 			log('Inserted as next:', title, 'at index', insertAt);
 		},
@@ -286,9 +291,9 @@
 	const Navigator = {
 		goTo(url) {
 			const parsed = new URL(url, location.origin);
-			const path = parsed.pathname + parsed.search;
+			const navPath = parsed.pathname + parsed.search;
 			const expectedId = parsed.searchParams.get('v');
-			log('Navigating to:', path);
+			log('Navigating to:', navPath);
 
 			const queueUrls = new Set(Storage.queue.map(v => {
 				try { return new URL(v.url, location.origin).searchParams.get('v'); } catch { return null; }
@@ -301,21 +306,34 @@
 				} catch { return false; }
 			});
 
-			if (!anchor) { log('No anchor found to hijack'); return; }
+			if (!anchor) {
+				// No anchor to hijack — use pushState + synthetic yt-navigate-finish so
+				// the script stays alive and Player._waitForVideoAndPlay() fires normally.
+				log('No anchor found — using pushState SPA navigation');
+				history.pushState({}, '', navPath);
+				window.dispatchEvent(new CustomEvent('yt-navigate-finish'));
+				return;
+			}
 
 			let mutated = false;
 			const handler = e => {
 				if (!e.detail?.endpoint) return;
-				const vid = e.detail.endpoint?.watchEndpoint?.videoId;
+				const ep = e.detail.endpoint;
 				if (!mutated) {
-					log('Mutating yt-navigate endpoint from', vid, 'to', expectedId);
-					const ep = e.detail.endpoint;
-					if (ep.watchEndpoint) ep.watchEndpoint.videoId = expectedId;
-					if (ep.commandMetadata?.webCommandMetadata) ep.commandMetadata.webCommandMetadata.url = path;
+					log('Mutating yt-navigate endpoint to', expectedId);
+					// Handle both watch-page shape (watchEndpoint) and non-watch-page shape
+					// (reelWatchEndpoint, browseEndpoint, etc. — normalise to watchEndpoint).
+					if (ep.watchEndpoint) {
+						ep.watchEndpoint.videoId = expectedId;
+					} else {
+						Object.keys(ep).forEach(k => { if (k.endsWith('Endpoint') || k.endsWith('endpoint')) delete ep[k]; });
+						ep.watchEndpoint = { videoId: expectedId };
+					}
+					if (ep.commandMetadata?.webCommandMetadata) ep.commandMetadata.webCommandMetadata.url = navPath;
 					ep.clickTrackingParams = '';
 					mutated = true;
 				} else {
-					log('Blocking duplicate yt-navigate for', vid);
+					log('Blocking duplicate yt-navigate for', ep.watchEndpoint?.videoId);
 					e.stopImmediatePropagation();
 					e.preventDefault();
 				}
@@ -339,6 +357,7 @@
 		_mediaSessionRefreshTimer: null,
 		_pendingSeekToStart: false,
 		_navStartTime: null,
+		_listenerAbort: null,   // AbortController for the current video's event listeners
 
 		start() {
 			this._playing = true;
@@ -370,6 +389,7 @@
 			PlayingTab.release();
 			Storage.setPaused(false);
 			this._clearEndPoll();
+			this._detachVideoListeners();
 			this._unregisterMediaSession();
 			UI.updateControls();
 			UI.showStatus('Queue stopped');
@@ -485,6 +505,7 @@
 				return;
 			}
 			this._attachedVideoId = videoId;
+			this._navigatingToPrev = false;   // unlock repeated previous presses
 			video._ytqmAttachedAt = Date.now();
 			this._attachVideoListeners(video);
 			this._scheduleEndPoll(video);
@@ -509,9 +530,21 @@
 			whenReady(restartFromBeginning ? seekThenPlay : play);
 		},
 
+		_detachVideoListeners() {
+			if (this._listenerAbort) {
+				this._listenerAbort.abort();
+				this._listenerAbort = null;
+				log('Video listeners detached');
+			}
+		},
+
 		_attachVideoListeners(video) {
-			if (video._ytqmListening) return;
-			video._ytqmListening = true;
+			// Tear down any listeners from a previous video before attaching new ones.
+			// YouTube reuses the same <video> element across SPA navigations, so without
+			// this the old handlers would keep firing on the new video.
+			this._detachVideoListeners();
+			this._listenerAbort = new AbortController();
+			const { signal } = this._listenerAbort;
 
 			video.addEventListener('pause', () => {
 				if (!this._playing || video.ended || Storage.paused) return;
@@ -519,26 +552,26 @@
 				this._userPaused = true;
 				log('Video paused by user');
 				UI.showStatus('Paused', 99999);
-			});
+			}, { signal });
 
-      video.addEventListener('play', () => {
-          this._userPaused = false;
-          if (this._navStartTime) {
-              const elapsed = ((Date.now() - this._navStartTime) / 1000).toFixed(2);
-              log(`Video playing (${elapsed}s since navigation)`);
-              this._navStartTime = null;
-          } else {
-              log('Video playing');
-          }
-          UI.showStatus('Playing', 2000);
-          if (this._playing && !this._endPollTimer) this._scheduleEndPoll(video);
-      });
+			video.addEventListener('play', () => {
+				this._userPaused = false;
+				if (this._navStartTime) {
+					const elapsed = ((Date.now() - this._navStartTime) / 1000).toFixed(2);
+					log(`Video playing (${elapsed}s since navigation)`);
+					this._navStartTime = null;
+				} else {
+					log('Video playing');
+				}
+				UI.showStatus('Playing', 2000);
+				if (this._playing && !this._endPollTimer) this._scheduleEndPoll(video);
+			}, { signal });
 
-			video.addEventListener('ended', () => UI.showStatus('Advancing queue…'));
-			video.addEventListener('waiting', () => UI.showStatus('Buffering…', 5000));
+			video.addEventListener('ended', () => UI.showStatus('Advancing queue…'), { signal });
+			video.addEventListener('waiting', () => UI.showStatus('Buffering…', 5000), { signal });
 			video.addEventListener('durationchange', () => {
 				if (this._playing && !isNaN(video.duration)) this._scheduleEndPoll(video);
-			});
+			}, { signal });
 
 			video.addEventListener('canplay', () => {
 				if (!this._pendingSeekToStart) return;
@@ -547,7 +580,7 @@
 				video.addEventListener('seeked', () => {
 					if (!this._userPaused && !Storage.paused) video.play().catch(() => this._clickPlayButton());
 				}, { once: true });
-			}, { once: true });
+			}, { once: true, signal });
 		},
 
 		advance() {
@@ -556,6 +589,7 @@
 			const next = Storage.peekFirst();
 			this._attachedVideoId = null;
 			this._navigatingToPrev = false;
+			this._detachVideoListeners();
 			UI.refreshPanel();
 			if (next) Navigator.goTo(next.url);
 			else this.stop();
@@ -575,7 +609,7 @@
 			}
 			log('Going to previous:', prev.title);
 			const s = Storage.load();
-			s.queue.unshift({ ...prev, id: Date.now() });
+			s.queue.unshift({ ...prev, id: _uid() });
 			Storage.save(s);
 			this._attachedVideoId = null;
 			this._navigatingToPrev = true;
@@ -641,16 +675,13 @@
 	// ── QueueIO ───────────────────────────────────────────────────────────────
 
 	const QueueIO = {
-		async exportToClipboard(includeHistory = false) {
+		async exportToClipboard() {
 			const state = Storage.load();
 			const payload = {
 				_ytqm: true,
 				exportedAt: new Date().toISOString(),
 				queue: state.queue.map(({ url, title, channel }) => ({ url, title, channel })),
 			};
-			if (includeHistory) {
-				payload.history = state.history.map(({ url, title, channel }) => ({ url, title, channel }));
-			}
 			const json = JSON.stringify(payload, null, 2);
 			try {
 				await navigator.clipboard.writeText(json);
@@ -662,7 +693,7 @@
 			}
 		},
 
-		async importFromClipboard(mode = 'replace') {
+		async importFromClipboard() {
 			let text;
 			try {
 				text = await navigator.clipboard.readText();
@@ -670,10 +701,7 @@
 				warn('Clipboard read failed:', e);
 				return { ok: false, added: 0, error: 'Clipboard read failed — check browser permissions.' };
 			}
-			return this._parseAndApply(text, mode);
-		},
 
-		_parseAndApply(text, mode) {
 			let parsed;
 			try { parsed = JSON.parse(text.trim()); }
 			catch { return { ok: false, added: 0, error: 'Invalid JSON — could not parse clipboard contents.' }; }
@@ -693,30 +721,21 @@
 			if (valid.length === 0) return { ok: false, added: 0, error: 'No valid YouTube watch URLs found in the import data.' };
 
 			const s = Storage.load();
-
-			if (mode === 'replace') {
-				s.queue = valid.map(({ url, title, channel }) => ({
-					url, title: title || 'Untitled video', channel: channel || '', id: Date.now() + Math.random(),
+			const existing = new Set(s.queue.map(v => v.url));
+			const newItems = valid
+				.filter(v => !existing.has(v.url))
+				.map(({ url, title, channel }) => ({
+					url, title: title || 'Untitled video', channel: channel || '', id: _uid(),
 				}));
-			} else {
-				const existing = new Set(s.queue.map(v => v.url));
-				const newItems = valid
-					.filter(v => !existing.has(v.url))
-					.map(({ url, title, channel }) => ({
-						url, title: title || 'Untitled video', channel: channel || '', id: Date.now() + Math.random(),
-					}));
-				if (mode === 'prepend') s.queue = [...newItems, ...s.queue];
-				else s.queue = [...s.queue, ...newItems];
-				valid.length = newItems.length;
-			}
+			s.queue = [...s.queue, ...newItems];
 
 			Storage.save(s);
 			Storage._invalidate();
-			log('Imported', valid.length, 'items, mode:', mode);
+			log('Imported', newItems.length, 'items');
 			UI.updateControls();
 			if (UI.panelOpen) UI.refreshPanel();
 			ThumbnailInjector.syncAllButtons();
-			return { ok: true, added: valid.length };
+			return { ok: true, added: newItems.length };
 		},
 	};
 
@@ -743,6 +762,11 @@
 			const s = Settings.get();
 			if (!s.enqueueFromPhone) return;
 
+			// Only poll from the tab that owns playback, or if no tab is playing at all.
+			// This prevents multiple open YouTube tabs from each making poll requests and
+			// potentially racing on queue insertions.
+			if (!PlayingTab.isOwner() && PlayingTab.anyPlaying()) return;
+
 			const serverUrl = (s.phoneServerUrl || 'http://localhost/poll').replace(/\/$/, '');
 			const pollUrl = serverUrl.endsWith('/poll') ? serverUrl : `${serverUrl}/poll`;
 
@@ -764,14 +788,15 @@
 			}
 
 			// Handle YouTube queue URL (new behaviour)
-			if (data.queue_url) {
-				log('PhonePoller: received queue URL', data.queue_url);
+			if (data.youtube_url) {
+				log('PhonePoller: received queue URL', data.youtube_url);
 				try {
-					const parsed = new URL(data.queue_url);
+					const parsed = new URL(data.youtube_url);
 					const videoId = parsed.searchParams.get('v');
-					if (!videoId) { warn('PhonePoller: no video ID in URL', data.queue_url); return; }
+					if (!videoId) { warn('PhonePoller: no video ID in URL', data.youtube_url); return; }
 					const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
-					const added = Storage.addVideo(watchUrl, 'Shared from phone', '');
+					const title = (data.title && data.title.trim()) ? data.title.trim() : 'Shared from phone';
+					const added = Storage.addVideo(watchUrl, title, '');
 					if (added) {
 						Storage._invalidate();
 						UI.updateControls();
@@ -828,7 +853,9 @@
 
 		_startHoverTracking() {
 			document.addEventListener('mouseenter', e => {
-				const card = e.target.closest?.(SEL.CARD) || e.target.closest?.('.ytp-suggestion-set');
+				const card = e.target.closest?.(SEL.CARD)
+					|| e.target.closest?.(SEL.VIDEO_PREVIEW)
+					|| e.target.closest?.('.ytp-suggestion-set');
 				if (!card) return;
 				const entry = this._cards.get(card);
 				if (!entry) return;
@@ -839,10 +866,16 @@
 			}, true);
 
 			document.addEventListener('mouseleave', e => {
-				const card = e.target.closest?.(SEL.CARD) || e.target.closest?.('.ytp-suggestion-set');
+				const card = e.target.closest?.(SEL.CARD)
+					|| e.target.closest?.(SEL.VIDEO_PREVIEW)
+					|| e.target.closest?.('.ytp-suggestion-set');
 				if (!card) return;
 				const rel = e.relatedTarget;
-				if (rel?.closest?.(SEL.CARD) === card || rel?.closest?.('.ytp-suggestion-set') === card) return;
+				if (
+					rel?.closest?.(SEL.CARD) === card ||
+					rel?.closest?.(SEL.VIDEO_PREVIEW) === card ||
+					rel?.closest?.('.ytp-suggestion-set') === card
+				) return;
 				const entry = this._cards.get(card);
 				if (!entry || entry.hideTimer) return;
 				entry.hideTimer = setTimeout(() => {
@@ -859,6 +892,13 @@
 				for (const m of mutations) {
 					m.addedNodes.forEach(node => {
 						if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+						// Handle ytd-video-preview containers (inline thumbnail player).
+						// The button must live on the outer ytd-video-preview wrapper so it
+						// survives YouTube swapping out ytd-thumbnail for ytd-player on hover.
+						if (node.matches?.('ytd-video-preview')) this._tryInjectVideoPreview(node);
+						node.querySelectorAll('ytd-video-preview').forEach(vp => this._tryInjectVideoPreview(vp));
+
 						this._tryInjectAnchor(node);
 						node.querySelectorAll('a[href*="/watch?v="]').forEach(a => this._tryInjectAnchor(a));
 						node.querySelectorAll(SEL.VIDEOWALL_ANCHOR).forEach(a => this._tryInjectVideowall(a));
@@ -870,9 +910,28 @@
 			this._observer.observe(target, { childList: true, subtree: true });
 		},
 
+		// Inject into ytd-video-preview wrappers. These wrap the inline hover-player
+		// that YouTube renders when you mouse over a card. The ytd-thumbnail inside
+		// gets replaced by ytd-player during hover, so any button injected there
+		// disappears. Anchoring to the outer ytd-video-preview avoids the swap.
+		_tryInjectVideoPreview(vpNode) {
+			if (vpNode.dataset.ytqmVpInjected) return;
+			const anchor = vpNode.querySelector('a[href*="/watch?v="]');
+			if (!anchor) return;
+			vpNode.dataset.ytqmVpInjected = '1';
+			// Signal to _injectButton to use this node as the positioning container
+			// rather than walking up to ytd-thumbnail (which will be swapped out).
+			anchor._ytqmVpContainer = vpNode;
+			this._injectButton(anchor, false);
+		},
+
 		_tryInjectAnchor(node) {
 			if (node.nodeType !== Node.ELEMENT_NODE) return;
-			if (node.matches('a[href*="/watch?v="]') && node.querySelector('img') && !node.querySelector('.ytqm-thumb-add-btn')) {
+			if (
+				node.matches('a[href*="/watch?v="]') &&
+				node.querySelector('img') &&
+				!node.dataset.ytqmInjected          // ← data-attr check instead of DOM query
+			) {
 				this._injectButton(node, false);
 			}
 		},
@@ -882,9 +941,14 @@
 		},
 
 		_injectAll() {
+			// Handle any ytd-video-preview already in the DOM (e.g. on initial load).
+			document.querySelectorAll('ytd-video-preview').forEach(vp => {
+				if (!vp.dataset.ytqmVpInjected) this._tryInjectVideoPreview(vp);
+			});
+
 			document.querySelectorAll('a[href*="/watch?v="]').forEach(anchor => {
 				if (!anchor.querySelector('img')) return;
-				if (anchor.querySelector('.ytqm-thumb-add-btn')) return;
+				if (anchor.dataset.ytqmInjected) return;   // ← data-attr check instead of DOM query
 				this._injectButton(anchor, false);
 			});
 			document.querySelectorAll(SEL.VIDEOWALL_ANCHOR).forEach(anchor => {
@@ -958,8 +1022,25 @@
 				videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
 			} catch { return; }
 
-			anchor.style.position = 'relative';
-			const card = isVideowall ? anchor : (anchor.closest(SEL.CARD) || anchor);
+			// Priority order for the positioning container:
+			//   1. _ytqmVpContainer — set by _tryInjectVideoPreview for inline hover-players.
+			//      ytd-video-preview survives the ytd-thumbnail → ytd-player DOM swap on hover.
+			//   2. ytd-thumbnail — safe wrapper for normal grid/list thumbnails.
+			//   3. parentElement / anchor itself — last-resort fallbacks.
+			const container = isVideowall
+				? anchor
+				: (anchor._ytqmVpContainer ?? anchor.closest('ytd-thumbnail') ?? anchor.parentElement ?? anchor);
+
+			container.style.position = 'relative';
+
+			// Mark the anchor with a data attribute so subsequent injection passes
+			// can skip it without querying into a container the button no longer
+			// lives in (since the button is now a child of `container`, not `anchor`).
+			if (!isVideowall) anchor.dataset.ytqmInjected = '1';
+
+			const card = isVideowall
+				? anchor
+				: (anchor._ytqmVpContainer ?? anchor.closest(SEL.CARD) ?? anchor);
 
 			const btn = document.createElement('button');
 			btn.className = 'ytqm-thumb-add-btn';
@@ -1030,7 +1111,7 @@
 				if (UI.panelOpen) UI.refreshPanel();
 			});
 
-			anchor.appendChild(btn);
+			container.appendChild(btn);
 			this._cards.set(card, entry);
 		},
 	};
@@ -1177,21 +1258,14 @@
         /* ── Import / Export section ── */
         #ytqm-io-section { border-top: 1px solid rgba(255,255,255,0.08); margin: 8px 0 0; padding: 12px 16px 14px; }
         #ytqm-io-title { font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: rgba(255,255,255,0.3); margin-bottom: 10px; }
-        .ytqm-io-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
-        .ytqm-io-row:last-child { margin-bottom: 0; }
+        .ytqm-io-row { display: flex; gap: 8px; margin-bottom: 0; align-items: center; }
         .ytqm-io-btn { flex: 1; background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.18); border-radius: 8px; color: rgba(255,255,255,0.8); font-size: 12px; font-weight: 600; font-family: inherit; padding: 7px 10px; cursor: pointer; transition: background 0.15s, color 0.15s; white-space: nowrap; text-align: center; }
         .ytqm-io-btn:hover { background: rgba(255,255,255,0.13); color: #fff; }
         .ytqm-io-btn.accent { background: rgba(39,174,96,0.15); border-color: rgba(39,174,96,0.35); color: rgba(39,174,96,0.9); }
         .ytqm-io-btn.accent:hover { background: rgba(39,174,96,0.25); color: #2ecc71; }
-        .ytqm-io-btn.danger { background: rgba(192,57,43,0.12); border-color: rgba(192,57,43,0.3); color: rgba(220,80,60,0.9); }
-        .ytqm-io-btn.danger:hover { background: rgba(192,57,43,0.22); color: #e74c3c; }
-        #ytqm-io-status { font-size: 11px; color: rgba(255,255,255,0.35); min-height: 16px; transition: color 0.2s; margin-top: 6px; text-align: center; }
+        #ytqm-io-status { font-size: 11px; color: rgba(255,255,255,0.35); min-height: 16px; transition: color 0.2s; margin-top: 8px; text-align: center; }
         #ytqm-io-status.ok  { color: rgba(46,204,113,0.85); }
         #ytqm-io-status.err { color: rgba(231,76,60,0.9); }
-        .ytqm-io-import-mode { display: flex; gap: 6px; margin-bottom: 8px; }
-        .ytqm-io-mode-btn { flex: 1; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; color: rgba(255,255,255,0.5); font-size: 11px; font-weight: 600; font-family: inherit; padding: 5px 4px; cursor: pointer; transition: all 0.15s; text-align: center; }
-        .ytqm-io-mode-btn.active { background: rgba(30,144,255,0.2); border-color: rgba(30,144,255,0.5); color: rgba(30,144,255,0.95); }
-        .ytqm-io-mode-btn:hover:not(.active) { background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.8); }
       `;
 		},
 
@@ -1208,8 +1282,7 @@
 
 		_cssStatusPill() {
 			return `
-        #ytqm-status            { bottom: 68px !important; transition: bottom 0.2s ease, opacity 0.3s; }
-        #ytqm-status.panel-open { bottom: 500px !important; }
+        #ytqm-status { bottom: 68px !important; transition: bottom 0.2s ease, opacity 0.3s; }
       `;
 		},
 
@@ -1383,15 +1456,15 @@
 			urlLabel.className = 'ytqm-setting-label';
 			urlLabel.textContent = 'Phone server URL';
 			const urlSmall = document.createElement('small');
-			urlSmall.textContent = 'Address of the /poll endpoint on your local server. Default: http://localhost/poll';
+			urlSmall.textContent = `Address of the /poll endpoint on your local server. Default: ${SETTINGS_DEFAULTS.phoneServerUrl}`;
 			urlLabel.appendChild(urlSmall);
 			const urlInput = document.createElement('input');
 			urlInput.id = 'ytqm-phone-url-input';
 			urlInput.type = 'text';
-			urlInput.placeholder = 'http://localhost/poll';
-			urlInput.value = Settings.get().phoneServerUrl || 'http://localhost/poll';
+			urlInput.placeholder = SETTINGS_DEFAULTS.phoneServerUrl;
+			urlInput.value = Settings.get().phoneServerUrl || SETTINGS_DEFAULTS.phoneServerUrl;
 			urlInput.addEventListener('change', () => {
-				Settings.set('phoneServerUrl', urlInput.value.trim() || 'http://localhost/poll');
+				Settings.set('phoneServerUrl', urlInput.value.trim() || SETTINGS_DEFAULTS.phoneServerUrl);
 				log('Setting changed: phoneServerUrl =', Settings.get().phoneServerUrl);
 			});
 			urlRow.append(urlLabel, urlInput);
@@ -1415,68 +1488,31 @@
 				if (msg) ioStatusTimer = setTimeout(() => { ioStatus.textContent = ''; ioStatus.className = ''; }, durationMs);
 			};
 
-			let importMode = 'replace';
-			const modeRow = document.createElement('div');
-			modeRow.className = 'ytqm-io-import-mode';
-			const modes = [
-				{ id: 'replace', label: 'Replace' },
-				{ id: 'append',  label: 'Append'  },
-				{ id: 'prepend', label: 'Prepend' },
-			];
-			const modeBtns = {};
-			modes.forEach(({ id, label }) => {
-				const b = document.createElement('button');
-				b.className = 'ytqm-io-mode-btn' + (id === importMode ? ' active' : '');
-				b.textContent = label;
-				b.title = id === 'replace' ? 'Clear queue and load imported items'
-				        : id === 'append'  ? 'Add imported items after the current queue'
-				        :                    'Add imported items before the current queue';
-				b.addEventListener('click', () => {
-					importMode = id;
-					Object.values(modeBtns).forEach(x => x.classList.remove('active'));
-					b.classList.add('active');
-				});
-				modeBtns[id] = b;
-				modeRow.appendChild(b);
-			});
-
-			const exportRow = document.createElement('div');
-			exportRow.className = 'ytqm-io-row';
+			const ioRow = document.createElement('div');
+			ioRow.className = 'ytqm-io-row';
 
 			const exportBtn = document.createElement('button');
 			exportBtn.className = 'ytqm-io-btn accent';
-			exportBtn.textContent = '⬆ Copy Queue JSON';
-			exportBtn.title = 'Copy the current queue to the clipboard as JSON (left-click: queue only; right-click: include history)';
+			exportBtn.textContent = '⬆ Copy Queue';
+			exportBtn.title = 'Copy the current queue to the clipboard as JSON';
 			exportBtn.addEventListener('click', async () => {
-				const { ok, count } = await QueueIO.exportToClipboard(false);
+				const { ok, count } = await QueueIO.exportToClipboard();
 				if (ok) setIoStatus(`✓ Copied ${count} item${count !== 1 ? 's' : ''} to clipboard`, 'ok');
 				else setIoStatus('✗ Clipboard write failed — check browser permissions', 'err');
 			});
-			exportBtn.addEventListener('contextmenu', async e => {
-				e.preventDefault();
-				const { ok, count } = await QueueIO.exportToClipboard(true);
-				if (ok) setIoStatus(`✓ Copied ${count} item${count !== 1 ? 's' : ''} + history to clipboard`, 'ok');
-				else setIoStatus('✗ Clipboard write failed — check browser permissions', 'err');
-			});
-
-			exportRow.appendChild(exportBtn);
-
-			const importRow = document.createElement('div');
-			importRow.className = 'ytqm-io-row';
 
 			const importBtn = document.createElement('button');
 			importBtn.className = 'ytqm-io-btn';
-			importBtn.textContent = '⬇ Paste & Import JSON';
-			importBtn.title = 'Read JSON from the clipboard and load it into the queue using the selected mode above';
+			importBtn.textContent = '⬇ Paste & Append';
+			importBtn.title = 'Read JSON from the clipboard and append new items to the queue';
 			importBtn.addEventListener('click', async () => {
-				const { ok, added, error } = await QueueIO.importFromClipboard(importMode);
-				if (ok) setIoStatus(`✓ Imported ${added} item${added !== 1 ? 's' : ''} (${importMode})`, 'ok');
+				const { ok, added, error } = await QueueIO.importFromClipboard();
+				if (ok) setIoStatus(`✓ Appended ${added} item${added !== 1 ? 's' : ''} to queue`, 'ok');
 				else setIoStatus(`✗ ${error}`, 'err');
 			});
 
-			importRow.appendChild(importBtn);
-
-			ioSection.append(ioTitle, modeRow, exportRow, importRow, ioStatus);
+			ioRow.append(exportBtn, importBtn);
+			ioSection.append(ioTitle, ioRow, ioStatus);
 			body.appendChild(ioSection);
 
 			modal.append(header, body);
@@ -1488,7 +1524,7 @@
 			this.settingsOverlay.querySelectorAll('input[type="checkbox"]').forEach(input => { input.checked = Settings.get()[input._ytqmSettingKey]; });
 			this.settingsOverlay.querySelectorAll('input[type="number"]').forEach(input => { input.value = Settings.get()[input._ytqmSettingKey]; });
 			const urlInput = this.settingsOverlay.querySelector('#ytqm-phone-url-input');
-			if (urlInput) urlInput.value = Settings.get().phoneServerUrl || 'http://localhost/poll';
+			if (urlInput) urlInput.value = Settings.get().phoneServerUrl || SETTINGS_DEFAULTS.phoneServerUrl;
 			this.settingsOverlay.classList.add('open');
 		},
 
@@ -1557,10 +1593,10 @@
 			let pill = this.shadow.getElementById('ytqm-status');
 			if (!pill) {
 				pill = document.createElement('div'); pill.id = 'ytqm-status';
-				Object.assign(pill.style, { position: 'fixed', left: '20px', background: 'rgba(0,0,0,0.82)', color: '#fff', fontSize: '12px', fontFamily: "'Segoe UI', system-ui, sans-serif", fontWeight: '600', padding: '6px 14px', borderRadius: '999px', border: '1px solid rgba(255,255,255,0.2)', pointerEvents: 'none', opacity: '0', zIndex: '1' });
+				Object.assign(pill.style, { position: 'fixed', left: '20px', bottom: '68px', background: 'rgba(0,0,0,0.82)', color: '#fff', fontSize: '12px', fontFamily: "'Segoe UI', system-ui, sans-serif", fontWeight: '600', padding: '6px 14px', borderRadius: '999px', border: '1px solid rgba(255,255,255,0.2)', pointerEvents: 'none', opacity: '0', zIndex: '1', transition: 'bottom 0.2s ease, opacity 0.3s' });
 				this.shadow.appendChild(pill);
 			}
-			pill.classList.toggle('panel-open', this.panelOpen);
+			this._updateStatusPillPosition();
 			pill.textContent = msg; pill.style.opacity = '1';
 			clearTimeout(pill._hideTimer);
 			pill._hideTimer = setTimeout(() => { pill.style.opacity = '0'; }, durationMs);
@@ -1606,8 +1642,19 @@
 			this.panelOpen = force !== undefined ? force : !this.panelOpen;
 			if (this.panelOpen) { this.refreshPanel(); this.panel.classList.add('open'); }
 			else { this.panel.classList.remove('open'); }
+			this._updateStatusPillPosition();
+		},
+
+		_updateStatusPillPosition() {
 			const pill = this.shadow?.getElementById('ytqm-status');
-			if (pill) pill.classList.toggle('panel-open', this.panelOpen);
+			if (!pill) return;
+			if (this.panelOpen && this.panel) {
+				// Position the pill just above the open panel with a small gap.
+				const panelHeight = this.panel.getBoundingClientRect().height || 0;
+				pill.style.bottom = (panelHeight + 76) + 'px';
+			} else {
+				pill.style.bottom = '68px';
+			}
 		},
 
 		refreshPanel() {
