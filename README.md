@@ -1,10 +1,12 @@
 # YouTube Custom Queue
 
-YouTube's built-in queue is clunky and disappears between sessions. This userscript replaces it with a persistent, fully-featured queue manager. Add videos from thumbnail hover buttons without leaving the page, drag to reorder, and pick up exactly where you left off. Control playback from any tab, navigate history with your media keys, and tweak behaviour through a built-in settings menu including auto theater mode for narrow windows.
+YouTube's built-in queue is clunky and disappears between sessions. This userscript replaces it with a **persistent, cross-tab queue manager**.
 
-# Quick start
+Add videos from thumbnail hover buttons, drag to reorder, auto-advance through your queue, control playback from any tab, use media keys, and enjoy optional auto theater mode.
 
-Click the button below, your userscript manager will open and prompt you to confirm:
+---
+
+## Quick Start
 
 [![Install](https://img.shields.io/badge/Install-YouTube%20Custom%20Queue-green?style=for-the-badge)](https://raw.githubusercontent.com/Alpacinator/Youtube-Custom-Queue/main/Youtube-custom-queue.user.js)
 
@@ -12,99 +14,111 @@ Click the button below, your userscript manager will open and prompt you to conf
 
 ## Features
 
-- **Floating control bar**, Add to Queue, Play Queue, and Queue panel buttons always within reach
-- **Drag-to-reorder panel**, Visual queue list you can rearrange on the fly
-- **Thumbnail hover buttons**, Left-click to add/remove, right-click to insert as next
-- **Auto-advance**, Automatically plays the next video when the current one ends
-- **Cross-tab control**, Pause, resume, skip, and go back to previous from any YouTube tab
-- **History navigation**, Step back to previously played videos with the Prev button
-- **Media key support**, Next/previous track keys on your keyboard or headset work out of the box
-- **Auto theater mode**, Switches to theater mode when the window is narrower than 60% of your screen width
-- **Persistent storage**, Your queue survives page refreshes via `localStorage`
-- **Hide native YouTube buttons**, Optionally suppress YouTube's own Watch Later / Add to Queue thumbnail buttons
+- **Floating control bar** – Always-visible Add, Play, and Queue buttons
+- **Drag-to-reorder** queue panel
+- **Improved thumbnail hover buttons** – Left-click to add/remove • Right-click to "Play Next"
+- **Auto-advance** – Automatically plays the next video when the current one ends
+- **Cross-tab control** – Pause, resume, skip, and previous from any YouTube tab
+- **History navigation** – Go back to previously played videos with the Prev button
+- **Media key support** – Next / Previous track keys work reliably
+- **Auto theater mode** – Switches to theater mode on narrow browser windows
+- **Persistent storage** – Your queue survives refreshes and browser restarts via `localStorage`
+- **Hide native YouTube buttons** (optional) – Cleans up default Watch Later / Add to Queue buttons
+
+### Recent Improvements (v1.4.0)
+- Thumbnail buttons are now much more stable (no longer disappear on hover)
+- Better reliability when navigating between videos in the queue
+- Smarter phone integration (only polls from the active playback tab)
+- Simplified Import / Export in settings
 
 ---
 
 ## Requirements
 
-This is a **userscript**, a small piece of JavaScript that runs in your browser on top of existing websites. To use it, you need a userscript manager extension installed first.
+This is a **userscript**. You need a userscript manager installed first.
 
-### Step 1: Install a userscript manager
+| Browser              | Recommended Extension                  |
+|----------------------|----------------------------------------|
+| Firefox              | Tampermonkey or Greasemonkey           |
+| Chrome / Edge / Brave| Tampermonkey                           |
+| Safari               | Userscripts                            |
 
-Pick one for your browser:
+**Tampermonkey** is recommended for best compatibility.
 
-| Browser | Recommended extension |
-|---|---|
-| Firefox | [Greasemonkey](https://www.greasespot.net/) or [Tampermonkey](https://www.tampermonkey.net/) |
-| Chrome / Edge / Brave | [Tampermonkey](https://www.tampermonkey.net/) |
-| Safari | [Userscripts](https://apps.apple.com/app/userscripts/id1463298887) |
+### Install the Script
 
-> Tampermonkey is recommended across the board, it is the most actively maintained and has the widest compatibility.
+Click the button above, or install manually:
 
-### Step 2: Install the script
-
-Click the button below, your userscript manager will open and prompt you to confirm:
-
-[![Install](https://img.shields.io/badge/Install-YouTube%20Custom%20Queue-green?style=for-the-badge)](https://raw.githubusercontent.com/Alpacinator/Youtube-Custom-Queue/main/Youtube-custom-queue.user.js)
-
-Or install manually:
-1. Click the Tampermonkey icon → **Create a new script**
-2. Delete any placeholder code
-3. Copy the contents of [`Youtube-custom-queue.user.js`](./Youtube-custom-queue.user.js) and paste it in
-4. Press **Ctrl+S** (Cmd+S on Mac) to save
-5. Navigate to [youtube.com](https://www.youtube.com), the control bar will appear in the bottom-left corner
+1. Open Tampermonkey → **Create a new script**
+2. Delete the placeholder code
+3. Paste the full content of [`Youtube-custom-queue.user.js`](https://raw.githubusercontent.com/Alpacinator/Youtube-Custom-Queue/main/Youtube-custom-queue.user.js)
+4. Save (Ctrl/Cmd + S)
+5. Go to [youtube.com](https://www.youtube.com) — the control bar will appear in the bottom-left
 
 ---
 
 ## Usage
 
 ### Adding videos to the queue
-
-- **From any page**, hover over a video thumbnail and click the **+** button that appears in the top-left corner of the thumbnail
-- **Right-click** the thumbnail button to insert the video as the **next** to play
-- **From a watch page**, use the **＋ Add to Queue** button in the bottom-left control bar; right-click it to insert as next
+- **Hover** over any video thumbnail → click the **+** button in the top-left corner
+- **Right-click** the + button → insert as **next** to play
+- On a watch page → use the **＋ Add to Queue** button in the floating control bar (right-click for "next")
 
 ### Playing the queue
-
-1. Open any YouTube video
-2. Click **▶ Play Queue** in the control bar
-3. The queue will auto-advance through each video in order
+1. Click **▶ Play Queue** in the control bar
+2. The queue will automatically advance when each video ends
 
 ### Controls
 
-| Button | Action |
-|---|---|
-| **▶ Play Queue** | Start playing from the top of the queue |
-| **■ Stop Queue** | Stop queue playback |
-| **≡ Queue** | Open/close the queue panel |
-| **⏸ Pause / ▶ Resume** | Pause or resume from any tab |
-| **⏮ Prev** | Go back to the previous video |
-| **⏭ Skip** | Skip to the next video |
+| Button              | Action                              |
+|---------------------|-------------------------------------|
+| **▶ Play Queue**    | Start playing the queue             |
+| **■ Stop Queue**    | Stop queue playback                 |
+| **≡ Queue (n)**     | Open / close the queue panel        |
+| **⏸ / ▶**           | Pause / Resume (works across tabs)  |
+| **⏮ Prev**          | Go back to the previous video       |
+| **⏭ Skip**          | Skip to the next video              |
 
-### Queue panel
-
+### Queue Panel
 - Click **≡ Queue** to open the panel
-- **Drag** items to reorder them (the currently playing item is locked in place)
-- Click **✕** next to an item to remove it
-- Click the **Queue** heading at the top of the panel to open Settings
+- **Drag** items to reorder (currently playing video stays locked at the top)
+- Click **✕** to remove an item
+- Click the **"Queue"** title at the top to open **Settings**
 
 ---
 
 ## Settings
 
-Open the settings panel by clicking the **Queue** heading at the top of the open queue panel.
+Open Settings by clicking the **Queue** heading in the open queue panel.
 
-| Setting | Description |
-|---|---|
-| Cross-tab controls | Show pause, skip & previous buttons when another tab is playing |
-| Auto theater mode | Switch to theater mode on narrow windows automatically |
-| Block right-click menu | Suppress the browser context menu so right-clicking thumbnail buttons always triggers "play next" |
-| Aggressive MediaSession refresh | Periodically re-register media key handlers (fixes keys going silent after YouTube reinitialises its player) |
-| Refresh interval (seconds) | How often to re-register when aggressive refresh is on (default: 5 s) |
-| Hide YouTube's thumbnail buttons | Suppress YouTube's native Watch Later / Add to Queue hover buttons |
+| Setting                            | Description |
+|------------------------------------|-----------|
+| Cross-tab controls                 | Show pause, skip & previous buttons when another tab is playing |
+| Auto theater mode                  | Automatically switch to theater mode on narrow windows |
+| Block right-click menu             | Suppress context menu so right-click on thumbnail buttons always does "Play Next" |
+| Aggressive MediaSession refresh    | Periodically re-register media key handlers (fixes keys stopping after player reloads) |
+| Refresh interval (seconds)         | How often to refresh media handlers (default: 5) |
+| Hide YouTube's thumbnail buttons   | Hide native Watch Later / Add to Queue buttons |
+| Enqueue videos shared from phone   | Automatically add videos sent from your phone via local server |
+
+---
+
+## Changelog
+
+### v1.4.0 (Latest)
+- **Major stability improvement**: Thumbnail + buttons no longer disappear when hovering over videos (full support for YouTube’s inline hover player)
+- Added `AbortController` for clean video event listener management
+- Improved SPA navigation fallback when no anchor link is available
+- Phone poller is now smarter (only polls from the active playback tab)
+- Simplified Import / Export (now always appends; cleaner UI)
+- Added collision-resistant UID generation
+- Various bug fixes and reliability improvements
+
+### v1.3.0
+- Initial public release with core queue functionality, cross-tab support, media keys, auto theater mode, and settings.
 
 ---
 
 ## License
 
-[MIT](./LICENSE), use it, modify it, share it, do whatever you like.
+[MIT](./LICENSE) — Feel free to use, modify, and share.
