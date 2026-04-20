@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name YouTube Queue Manager
 // @namespace https://github.com/Alpacinator/Youtube-Custom-Queue/
-// @version 1.4.0
+// @version 1.4.1
 // @description A persistent, cross-tab YouTube queue manager with drag-to-reorder, auto-advance, and optional auto theater mode.
 // @match *://*.youtube.com/*
 // @grant none
@@ -151,7 +151,7 @@
 
 	const Storage = {
 		_cache: null,
-		_defaults() { return { queue: [], history: [], paused: false }; },
+		_defaults() { return { queue: [], history: [], paused: false, playing: false }; },
 		_invalidate() { this._cache = null; },
 		load() {
 			if (this._cache) return this._cache;
@@ -160,8 +160,8 @@
 				if (!raw) { this._cache = this._defaults(); return this._cache; }
 				const p = JSON.parse(raw);
 				if (p.paused === undefined) p.paused = false;
+				if (p.playing === undefined) p.playing = false;
 				if (!Array.isArray(p.history)) p.history = [];
-				delete p.playing;
 				this._cache = p;
 				return this._cache;
 			} catch (e) {
@@ -173,7 +173,7 @@
 		save(state) {
 			try {
 				this._cache = state;
-				localStorage.setItem(STORAGE_KEY, JSON.stringify({ queue: state.queue, history: state.history, paused: state.paused }));
+				localStorage.setItem(STORAGE_KEY, JSON.stringify({ queue: state.queue, history: state.history, paused: state.paused, playing: state.playing ?? false }));
 			} catch (e) { warn('Storage.save failed:', e); }
 		},
 		get queue() { return [...this.load().queue]; },
@@ -363,6 +363,7 @@
 			this._playing = true;
 			PlayingTab.claim();
 			Storage.setPaused(false);
+			{ const s = Storage.load(); s.playing = true; Storage.save(s); }
 			const first = Storage.peekFirst();
 			if (!first) { this.stop(); return; }
 			UI.updateControls();
@@ -388,6 +389,7 @@
 			this._navStartTime = null;
 			PlayingTab.release();
 			Storage.setPaused(false);
+			{ const s = Storage.load(); s.playing = false; Storage.save(s); }
 			this._clearEndPoll();
 			this._detachVideoListeners();
 			this._unregisterMediaSession();
@@ -596,6 +598,65 @@
 		},
 
 		skip() { if (this._playing) this.advance(); },
+
+		/**
+		 * Hard-reloads the current page (or navigates to `url` if provided) while
+		 * keeping the queue alive.  On boot the refresh-recovery path in tryInit()
+		 * sees playing=true and calls Player.start(), so playback resumes exactly
+		 * as if the queue had just advanced to this video naturally.
+		 *
+		 * If `url` points to a YouTube video that is NOT already at the front of
+		 * the queue, it is spliced in at position 0 so it becomes the next thing
+		 * that plays after the reload.
+		 *
+		 * @param {string} [url] - Optional YouTube watch URL or video ID to navigate
+		 *   to instead of reloading the current page.  Pass undefined / omit to
+		 *   simply reload the page the user is already on.
+		 */
+		reloadAndResume(url) {
+			// Resolve a bare video ID ("dQw4w9WgXcQ") to a full watch URL.
+			let targetUrl = url;
+			if (targetUrl && !targetUrl.includes('/')) {
+				targetUrl = `https://www.youtube.com/watch?v=${targetUrl}`;
+			}
+
+			let targetId = null;
+			if (targetUrl) {
+				try { targetId = new URL(targetUrl, location.origin).searchParams.get('v'); }
+				catch { warn('reloadAndResume: could not parse URL', targetUrl); }
+			}
+
+			// Ensure the target video is at queue[0] so boot-recovery plays it.
+			if (targetId) {
+				const s = Storage.load();
+				const existingIdx = s.queue.findIndex(v => {
+					try { return new URL(v.url, location.origin).searchParams.get('v') === targetId; }
+					catch { return false; }
+				});
+				if (existingIdx > 0) {
+					// Already in queue but not at the front — move it to position 0.
+					const [item] = s.queue.splice(existingIdx, 1);
+					s.queue.unshift(item);
+					Storage.save(s);
+				} else if (existingIdx === -1) {
+					// Not in queue at all — insert it at position 0.
+					s.queue.unshift({ url: `https://www.youtube.com/watch?v=${targetId}`, title: targetId, channel: '', id: _uid() });
+					Storage.save(s);
+				}
+				// existingIdx === 0 means it is already at the front — nothing to do.
+			}
+
+			// Stamp playing=true so tryInit() knows to resume after the reload.
+			{ const s = Storage.load(); s.playing = true; Storage.save(s); }
+
+			log('reloadAndResume: hard reloading', targetUrl || location.href);
+
+			if (targetId) {
+				location.href = `https://www.youtube.com/watch?v=${targetId}`;
+			} else {
+				location.reload();
+			}
+		},
 
 		previous() {
 			if (!this._playing) return;
@@ -1185,8 +1246,10 @@
         #ytqm-panel.open { display: flex; }
         #ytqm-panel-header { padding: 14px 16px 10px; font-size: 13px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: rgba(255,255,255,0.5); border-bottom: 1px solid rgba(255,255,255,0.08); display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
         .header-controls { display: flex; align-items: center; gap: 6px; }
-        #ytqm-panel-title { cursor: pointer; transition: color 0.2s ease, text-shadow 0.2s ease; border-radius: 4px; padding: 1px 3px; margin: -1px -3px; }
+        #ytqm-panel-title { cursor: pointer; transition: color 0.2s ease, text-shadow 0.2s ease; border-radius: 4px; padding: 1px 3px; margin: -1px -3px; display: inline-flex; align-items: center; gap: 6px; }
         #ytqm-panel-title:hover { color: #fff; text-shadow: 0 0 8px rgba(255,255,255,0.9), 0 0 20px rgba(255,255,255,0.4); }
+        #ytqm-cog-icon { width: 13px; height: 13px; color: rgba(255,255,255,0.3); flex-shrink: 0; transition: color 0.2s ease, transform 0.35s ease; }
+        #ytqm-panel-title:hover #ytqm-cog-icon { color: rgba(255,255,255,0.75); transform: rotate(60deg); }
 
         /* ── Now Playing ── */
         #ytqm-now-playing { flex-shrink: 0; padding: 10px 14px 12px; border-bottom: 1px solid rgba(255,255,255,0.08); background: rgba(255,255,255,0.03); }
@@ -1274,7 +1337,7 @@
         .ytqm-toggle { position: relative; flex-shrink: 0; width: 36px; height: 20px; cursor: pointer; }
         .ytqm-toggle input { opacity: 0; width: 0; height: 0; position: absolute; }
         .ytqm-toggle-track { position: absolute; inset: 0; background: rgba(255,255,255,0.15); border-radius: 999px; border: 1px solid rgba(255,255,255,0.2); transition: background 0.2s, border-color 0.2s; }
-        .ytqm-toggle input:checked + .ytqm-toggle-track { background: rgba(39,174,96,0.85); border-color: rgba(39,174,96,0.6); }
+        .ytqm-toggle input:checked + .ytqm-toggle-track { background: rgba(204,0,0,0.85); border-color: rgba(204,0,0,0.6); }
         .ytqm-toggle-thumb { position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; background: #fff; border-radius: 50%; box-shadow: 0 1px 4px rgba(0,0,0,0.4); transition: transform 0.2s; pointer-events: none; }
         .ytqm-toggle input:checked ~ .ytqm-toggle-thumb { transform: translateX(16px); }
       `;
@@ -1325,8 +1388,20 @@
 			const header = document.createElement('div');
 			header.id = 'ytqm-panel-header';
 			const title = document.createElement('span');
-			title.id = 'ytqm-panel-title'; title.textContent = 'Queue'; title.title = 'Open settings';
+			title.id = 'ytqm-panel-title'; title.title = 'Open settings';
 			title.addEventListener('click', e => { e.stopPropagation(); this.openSettings(); });
+
+			const titleText = document.createElement('span');
+			titleText.textContent = 'Queue';
+
+			const cogIcon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+			cogIcon.setAttribute('id', 'ytqm-cog-icon');
+			cogIcon.setAttribute('viewBox', '0 0 20 20');
+			cogIcon.setAttribute('fill', 'currentColor');
+			cogIcon.setAttribute('aria-hidden', 'true');
+			cogIcon.innerHTML = `<path fill-rule="evenodd" d="M11.49 3.17c-.38-1.56-2.6-1.56-2.98 0a1.532 1.532 0 01-2.286.948c-1.372-.836-2.942.734-2.106 2.106.54.886.061 2.042-.947 2.287-1.561.379-1.561 2.6 0 2.978a1.532 1.532 0 01.947 2.287c-.836 1.372.734 2.942 2.106 2.106a1.532 1.532 0 012.287.947c.379 1.561 2.6 1.561 2.978 0a1.533 1.533 0 012.287-.947c1.372.836 2.942-.734 2.106-2.106a1.533 1.533 0 01.947-2.287c1.561-.379 1.561-2.6 0-2.978a1.532 1.532 0 01-.947-2.287c.836-1.372-.734-2.942-2.106-2.106a1.532 1.532 0 01-2.287-.947zM10 13a3 3 0 100-6 3 3 0 000 6z" clip-rule="evenodd"/>`;
+
+			title.append(titleText, cogIcon);
 			const controls = document.createElement('div');
 			controls.className = 'header-controls';
 			this.remotePauseBtn = document.createElement('button');
@@ -1852,9 +1927,35 @@
 		NativeButtonHider.apply();
 		if (Page.isWatchPage()) TheaterMode.init();
 		if (Settings.get().enqueueFromPhone) PhonePoller.start();
+
+		// Recover playback state after a page refresh. If the playing flag was
+		// persisted but Player._playing is false (it's always false on boot),
+		// a refresh happened mid-queue — resume from where we left off.
+		const _bootState = Storage.load();
+		if (_bootState.playing && _bootState.queue.length > 0) {
+			log('Resuming queue after page refresh — queue has', _bootState.queue.length, 'items.');
+			Player.start();
+		}
+
 		log('Ready. Queue has', Storage.queue.length, 'items.');
 	}
 
 	if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', tryInit);
 	else tryInit();
+
+	// ── Public API ────────────────────────────────────────────────────────────
+	// Exposed on window so you can call these from the browser console or from
+	// other userscripts / bookmarklets without digging into the closure.
+	//
+	//   window.ytQueueManager.reloadAndResume()
+	//     Hard-reloads the current page; queue resumes automatically on boot.
+	//
+	//   window.ytQueueManager.reloadAndResume('https://www.youtube.com/watch?v=XYZ')
+	//   window.ytQueueManager.reloadAndResume('XYZ')
+	//     Navigates to the given video (full URL or bare video ID) with a hard
+	//     load, splicing it to the front of the queue if needed, then resumes.
+	//
+	window.ytQueueManager = {
+		reloadAndResume: (url) => Player.reloadAndResume(url),
+	};
 })();
