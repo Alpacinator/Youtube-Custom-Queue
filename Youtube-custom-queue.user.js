@@ -1192,7 +1192,7 @@
 			document.getElementById('ytqm-host')?.remove();
 			this.host = document.createElement('div');
 			this.host.id = 'ytqm-host';
-			Object.assign(this.host.style, { position: 'fixed', bottom: '0', left: '0', zIndex: '100', pointerEvents: 'none', width: '0', height: '0' });
+			Object.assign(this.host.style, { position: 'fixed', bottom: '0', left: '0', zIndex: '9999', pointerEvents: 'none', width: '0', height: '0' });
 			this.shadow = this.host.attachShadow({ mode: 'open' });
 			const style = document.createElement('style');
 			style.textContent = this._css();
