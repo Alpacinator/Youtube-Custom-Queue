@@ -1924,10 +1924,11 @@
         @keyframes ytqm-bar { from { opacity: 0.45; transform: scaleY(0.35); } to { opacity: 1; transform: scaleY(1); } }
 
         /* ── Up Next label + queue actions (Shuffle / Clear) ── */
-        #ytqm-up-next-label { flex-shrink: 0; padding: 9px 14px 3px; font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: rgba(255,255,255,0.25); display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-        .ytqm-queue-actions { display: inline-flex; gap: 4px; margin-left: auto; }
-        .ytqm-mini-btn { background: none; border: 1px solid rgba(255,255,255,0.18); border-radius: 6px; color: rgba(255,255,255,0.5); cursor: pointer; font-family: inherit; font-size: 12px; line-height: 1; padding: 3px 7px; transition: background 0.15s, color 0.15s, border-color 0.15s; }
-        .ytqm-mini-btn:hover { background: rgba(255,255,255,0.08); color: #fff; border-color: rgba(255,255,255,0.4); }
+        #ytqm-up-next-label { flex-shrink: 0; padding: 9px 14px 3px; font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: rgba(255,255,255,0.25); display: flex; align-items: center; gap: 8px; }
+        .ytqm-up-next-text { flex-shrink: 0; white-space: nowrap; }
+        .ytqm-queue-actions { display: flex; gap: 10px; margin-left: auto; margin-right: 0px; flex-shrink: 0; }
+        .ytqm-mini-btn { background: none; border: 1px solid rgba(255,255,255,0.25); border-radius: 999px; color: rgba(255,255,255,0.7); cursor: pointer; font-family: inherit; font-size: 12px; line-height: 1; padding: 3px 10px; transition: all 0.15s; }
+        .ytqm-mini-btn:hover { background: rgba(255,255,255,0.1); color: #fff; border-color: rgba(255,255,255,0.45); }
         #ytqm-clear-btn:hover { background: rgba(231,76,60,0.18); color: #ff6b5e; border-color: rgba(231,76,60,0.5); }
       `;
 		},
@@ -2149,6 +2150,7 @@
 			this.upNextLabel.style.display = 'none';
 
 			const upNextText = document.createElement('span');
+			upNextText.className = 'ytqm-up-next-text';
 			upNextText.textContent = 'Up Next';
 
 			const queueActions = document.createElement('span');
@@ -2696,7 +2698,7 @@
 
 			if (playing && queue.length > 0) {
 				this.nowPlayingSection.style.display = 'block';
-				this.upNextLabel.style.display = queue.length > 1 ? 'block' : 'none';
+				this.upNextLabel.style.display = queue.length > 1 ? 'flex' : 'none';
 				const npText = this.shadow.getElementById('ytqm-now-playing-text');
 				if (npText) npText.textContent = queue[0].title;
 			} else {
@@ -3111,7 +3113,7 @@
 	//     build is actually running on a page.
 	//
 	window.ytQueueManager = {
-		version: '1.5.0',
+		version: '2.0.0',
 		reloadAndResume: (url) => Player.reloadAndResume(url),
 		setDebug: (on) => {
 			DEBUG = !!on;
