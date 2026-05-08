@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name YouTube Queue Manager
 // @namespace https://github.com/Alpacinator/Youtube-Custom-Queue/
-// @version 2.0.0
+// @version 2.1.0
 // @description A persistent, cross-tab YouTube queue manager with drag-to-reorder, auto-advance, and optional auto theater mode.
 // @match *://*.youtube.com/*
 // @grant none
@@ -10,7 +10,84 @@
 
 /**
  * ─────────────────────────────────────────────────────────────────────────────
- *  CHANGELOG — 2.0.0
+ *  CHANGELOG, 2.1.0
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  Navigation overhaul:
+ *    • All in-script navigation now funnels through a single Navigator.goTo().
+ *      Every call site that previously used location.href, location.reload(),
+ *      or a direct anchor search now goes through this one entry point.
+ *
+ *    • Navigator hijacks a YouTube SPA-wired anchor (a.yt-simple-endpoint)
+ *      rather than the first <a> in the DOM. Video-card lockup anchors have
+ *      rel="nofollow", carry no .data property, and are not wired to
+ *      YouTube’s SPA router — clicking them does nothing useful. SPA-wired
+ *      anchors are selected in preference order:
+ *        1. Mini-guide “Home” entry  (a.yt-simple-endpoint#endpoint[href="/"])
+ *        2. Any other mini-guide or full-guide entry
+ *        3. Any a.yt-simple-endpoint
+ *        4. Last resort: any <a> (warns; unlikely to SPA-navigate)
+ *
+ *    • Three-layer hijack fires from a single anchor.click():
+ *        1. href rewrite — sets anchor.href to the target /watch?v=ID so
+ *           that a hard-nav fallback lands on the right page.
+ *        2. .data mutation (PRIMARY) — overwrites the anchor’s .data
+ *           property with a fresh watchEndpoint before the click. YouTube’s
+ *           Polymer click handler reads .data synchronously; mutating it
+ *           is the canonical way to redirect a yt-simple-endpoint click.
+ *        3. yt-navigate listener (FALLBACK) — a one-shot capture-phase
+ *           handler that mutates e.detail.endpoint on the rare code paths
+ *           that do dispatch the event.
+ *      After NAV_HREF_RESTORE_MS (2 s) the href and .data are restored so
+ *      the DOM is not left permanently mutated.
+ *
+ *    • Firefox compatibility: .data assignment across the Xray compartment
+ *      boundary threw "Not allowed to define cross-origin object as property
+ *      on XrayWrapper". Fixed via two helpers — pageCompatSet(el, prop, val)
+ *      and pageCompatGet(el, prop) — that on Firefox use cloneInto() and
+ *      wrappedJSObject to cross the boundary, and are plain pass-throughs on
+ *      Chromium.
+ *
+ *    • Player.reloadAndResume() no longer does a hard reload via
+ *      location.href / location.reload(). It routes through Navigator.goTo()
+ *      like everything else. Calling it while already on the target video
+ *      is a no-op + reattach rather than a full refresh.
+ *
+ *  Stop queue on user navigation:
+ *    • Navigator.goTo() stamps Navigator._pendingVideoId with the expected
+ *      destination video ID immediately before firing the fake click.
+ *    • The yt-navigate-finish listener reads and clears that stamp on every
+ *      navigation. If the queue is playing and the arrived video ID does not
+ *      match _pendingVideoId (or _pendingVideoId is null, meaning no
+ *      navigation was in flight from our side), the user navigated
+ *      themselves — the queue stops and shows "Queue stopped — you
+ *      navigated away".
+ *    • Does NOT stop the queue on hard reloads (yt-navigate-finish doesn’t
+ *      fire; tryInit() recovers via the persisted playing flag) or on
+ *      browser back/forward (popstate path, not yt-navigate-finish).
+ *
+ *  Diagnostics:
+ *    • Always-on boot banner printed via console.info on every page load,
+ *      regardless of the DEBUG flag:
+ *        [YT-Q] v2.1.0 loaded. Verbose logging is OFF — toggle with
+ *        window.ytQueueManager.setDebug(true|false).
+ *    • Log prefix is [YT-Q] (no dash). Chrome DevTools treats a leading
+ *      hyphen in filter tokens as a NOT operator, so "yt-q" would silently
+ *      exclude every line. Filter for YT-Q (no quotes needed) to see all
+ *      output from this script.
+ *    • Verbose logging (enabled via window.ytQueueManager.setDebug(true)
+ *      or localStorage.setItem(‘ytqm_debug’, ‘1’)) now covers:
+ *        – Player.start / stop / advance / skip / remotePause / remoteResume
+ *        – Navigator: which anchor tier was picked and why, the anchor’s
+ *          full description, the endpoint on .data before and after the
+ *          hijack, the href rewrite, .data write success + readback,
+ *          whether yt-navigate fired, cleanup-timer events.
+ *    • Single VERSION constant drives both the boot banner and
+ *      window.ytQueueManager.version; only @version in the metadata header
+ *      needs a separate bump (Tampermonkey reads it before JS runs).
+ *
+ *  See 2.0.0 changelog (below) for prior changes.
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  CHANGELOG, 2.0.0
  * ─────────────────────────────────────────────────────────────────────────────
  *  Bug fixes:
  *    • Removed dead `_pendingSeekToStart` branch in Player (never set true).
@@ -53,7 +130,7 @@
  *    • New helper `getVideoId(url)` replaces ~10 ad-hoc URL-parse blocks.
  *    • Storage now exposes a `mutate(fn)` helper; addVideo/removeVideo/etc.
  *      use it, eliminating the load/mutate/save/_invalidate boilerplate.
- *    • Storage._invalidate() is no longer needed externally — kept for the
+ *    • Storage._invalidate() is no longer needed externally, kept for the
  *      cross-tab `storage` event listener only.
  * ─────────────────────────────────────────────────────────────────────────────
  *
@@ -69,8 +146,11 @@
  *  PlayingTab     Claims "ownership" of playback via a heartbeat in localStorage
  *                 so that other tabs know not to also start playing.
  *
- *  Navigator      Uses YouTube's internal yt-navigate event to perform SPA
- *                 navigation without triggering a full page reload.
+ *  Navigator      Single navigation entry point. Hijacks an SPA-wired anchor
+ *                 (a.yt-simple-endpoint, preferring the mini-guide "Home"
+ *                 entry), points it at the target via both href rewriting
+ *                 and a yt-navigate endpoint mutation, then fakes a click.
+ *                 Used by every navigation site in the script.
  *
  *  Player         Owns the end-to-end playback lifecycle: attaches to the
  *                 <video> element, drives the end-poll timer, integrates with
@@ -97,17 +177,24 @@
 (function() {
 	'use strict';
 
+	// Single source of truth for the runtime version. Mirrors the @version
+	// metadata at the top of this file; both must be bumped together. The
+	// public API exposes this as window.ytQueueManager.version, and the boot
+	// banner prints it so users can verify which build is actually running.
+	const VERSION = '2.1.0';
+
 	const STORAGE_KEY = 'yt_queue_manager_v1';
 	const PLAYING_KEY = 'yt_queue_playing_tab';
 	const HEARTBEAT_KEY = 'yt_queue_heartbeat';
 	const SKIP_KEY = 'yt_queue_skip_signal';
 	const SETTINGS_KEY = 'yt_queue_settings_v1';
-	const DEBUG_KEY = 'ytqm_debug'; // localStorage flag — set to '1' to enable verbose logging
+	const DEBUG_KEY = 'ytqm_debug'; // localStorage flag, set to '1' to enable verbose logging
 	const HEARTBEAT_INTERVAL_MS = 3000;
 	const HEARTBEAT_TTL_MS = 10000;
 	const VIDEO_END_THRESHOLD_S = 2;
-	const HISTORY_MAX = 50; // bumped from 10 — the JSON cost is trivial and 10 is too small in practice
+	const HISTORY_MAX = 50; // bumped from 10, the JSON cost is trivial and 10 is too small in practice
 	const NAV_TIMEOUT_MS = 30000;
+	const NAV_HREF_RESTORE_MS = 2000; // how long after click() before we restore the hijacked anchor's original href
 	const ATTACH_POLL_INTERVAL_MS = 500;
 	const UNAVAILABLE_CHECK_DELAY_MS = 1500; // grace period before treating a missing <video> as "video unavailable"
 	const ENSURE_PLAYING_ATTEMPTS = 24;
@@ -124,7 +211,7 @@
 	const STATUS_DEFAULT_DURATION_MS = 3500;
 	const PHONE_POLL_INTERVAL_MS = 3000;
 
-	// Thumbnail button colours — referenced from a single <style> sheet now,
+	// Thumbnail button colours, referenced from a single <style> sheet now,
 	// not inline. Kept here as the source of truth so they stay in sync if
 	// you want to tweak them at runtime.
 	const THUMB_BTN_GREEN_RGB = '0,210,100';
@@ -172,10 +259,10 @@
 		VIDEO_PREVIEW: 'ytd-video-preview',
 	};
 
-	const LOG_PREFIX = '[YT-Queue]';
+	const LOG_PREFIX = '[YT-Q]';
 
 	// Verbose logging is opt-in. Enable from the console with:
-	//   localStorage.setItem('ytqm_debug', '1'); location.reload();
+	// localStorage.setItem('ytqm_debug', true|false); location.reload();
 	// We cache the flag at boot to avoid hitting localStorage on every log call;
 	// flip it at runtime via window.ytQueueManager.setDebug(true|false).
 	let DEBUG = localStorage.getItem(DEBUG_KEY) === '1';
@@ -184,9 +271,58 @@
 		if (DEBUG) console.log(LOG_PREFIX, ...args);
 	}
 
-	// Warnings always print — they signal real problems devs need to see.
+	// Warnings always print, they signal real problems devs need to see.
 	function warn(...args) {
 		console.warn(LOG_PREFIX, ...args);
+	}
+
+	// ── Firefox Xray-wrapper shims ────────────────────────────────────────────
+	//
+	// On Firefox, userscripts run in a separate JavaScript compartment from the
+	// page (the "Xray vision" model). DOM elements you read from the page are
+	// returned as XrayWrappers; assigning a userscript-compartment object as a
+	// property on one of those (e.g. `anchor.data = {...}`) throws:
+	//
+	//   "Not allowed to define cross-origin object as property on
+	//    [Object] or [Array] XrayWrapper"
+	//
+	// To write through an Xray wrapper we need two things:
+	//   1. The object we're assigning has to live in the PAGE compartment.
+	//      `cloneInto(obj, window)` performs a structured clone of `obj` into
+	//      that compartment.
+	//   2. We have to write through the wrapper's `wrappedJSObject` view,
+	//      which is the unwrapped page-side reference to the same element.
+	//
+	// On Chromium there is no compartment split, both `cloneInto` and
+	// `wrappedJSObject` are absent, so we provide pass-through shims. The
+	// same call site (`pageCompatSet(anchor, 'data', payload)`) then works
+	// identically on both browsers.
+
+	const _cloneInto = (typeof cloneInto === 'function')
+		? (obj) => cloneInto(obj, window, { cloneFunctions: false })
+		: (obj) => obj; // Chromium: no compartment split, pass through
+
+	/**
+	 * Set a property on a DOM element in a way that works on both Firefox
+	 * (XrayWrapper-aware) and Chromium (plain assignment).
+	 *
+	 * @param {Element} el     The DOM element (may be an XrayWrapper on FF).
+	 * @param {string}  prop   Property name to set.
+	 * @param {*}       value  Value to assign, will be cloneInto'd on FF.
+	 */
+	function pageCompatSet(el, prop, value) {
+		const target = el.wrappedJSObject || el;
+		target[prop] = _cloneInto(value);
+	}
+
+	/**
+	 * Read a property from a DOM element in a way that pierces Firefox's
+	 * Xray wrapper. Returns the page-compartment value (not a wrapper),
+	 * which is what we want when stashing the original `.data` for restore.
+	 */
+	function pageCompatGet(el, prop) {
+		const target = el.wrappedJSObject || el;
+		return target[prop];
 	}
 
 	/**
@@ -259,7 +395,7 @@
 	// IMPORTANT: every mutating method goes through `mutate(fn)`, which forces
 	// a fresh re-read from localStorage immediately before applying the edit.
 	// This narrows the cross-tab write race to the single event-loop tick
-	// between read and write — without it, two tabs could simultaneously load
+	// between read and write, without it, two tabs could simultaneously load
 	// the same snapshot, each add a video, and the second tab's save would
 	// silently overwrite the first tab's addition.
 
@@ -334,7 +470,7 @@
 			fn(s);
 			this.save(s);
 		},
-		/** Quick membership probe — does NOT clone, do not mutate the result. */
+		/** Quick membership probe, does NOT clone, do not mutate the result. */
 		isQueued(url) {
 			this.load(); // ensure _queueUrlSet is built
 			return this._queueUrlSet.has(url);
@@ -406,7 +542,7 @@
 		 * Move a queue item from index `from` to `to`. No clamping: callers
 		 * pass actual queue indices directly. The "now playing" item (index
 		 * 0 when playing) is visually separated in the UI so it never appears
-		 * in the draggable list — no need to guard it here.
+		 * in the draggable list, no need to guard it here.
 		 */
 		reorder(from, to) {
 			if (from === to) return;
@@ -468,7 +604,7 @@
 	window.addEventListener('beforeunload', () => PlayingTab.release());
 
 	const Page = {
-		// Memoise by full URL — `isWatchPage()` is called from many hot paths
+		// Memoise by full URL, `isWatchPage()` is called from many hot paths
 		// (updateControls, ThumbnailInjector, etc.) and reparsing the search
 		// string each time is wasteful given the URL only changes on SPA nav.
 		_cachedHref: null,
@@ -482,12 +618,144 @@
 	};
 
 	// ── Navigator ─────────────────────────────────────────────────────────────
+	//
+	// Single navigation entry point for the entire script. Every place that
+	// wants to change which video the user is on calls Navigator.goTo(url).
+	//
+	// Strategy: hijack a YouTube SPA-wired anchor (an `a.yt-simple-endpoint`),
+	// repoint it at our target video, and fake a click. Three layers of hijack
+	// fire from one click; each is a defence in depth for a different YouTube
+	// click-handling code path:
+	//
+	//   1. Save the anchor's original href.
+	//   2. Rewrite href to the target watch URL, covers the case where the
+	//      click triggers a real (non-SPA) navigation.
+	//   3. PRIMARY: overwrite the anchor's `.data` property with a fresh
+	//      watchEndpoint pointing at our target videoId. `yt-simple-endpoint`
+	//      anchors carry their navigation target as an endpoint object on
+	//      `.data`; YouTube's Polymer click handler reads that property
+	//      synchronously when the user clicks and routes off it. Mutating
+	//      `.data` IS the navigation-targeting mechanism, there is no
+	//      `yt-navigate` event to intercept earlier than this read.
+	//   4. FALLBACK: a one-shot, capture-phase `yt-navigate` listener that
+	//      mutates the endpoint object in `e.detail.endpoint` if YouTube DOES
+	//      end up dispatching that event (some code paths do). If the .data
+	//      assignment from step 3 didn't take for some reason, this catches
+	//      it on the way out.
+	//   5. anchor.click().
+	//   6. After NAV_HREF_RESTORE_MS, restore the anchor's original href and
+	//      `.data`, and remove the yt-navigate handler. If the click did
+	//      trigger a hard nav, the page is gone by then and the cleanup is a
+	//      no-op.
+	//
+	// Anchor selection (preference order, see _findAnchor):
+	//   1. The "Home" entry in the mini-guide (`<a id="endpoint" href="/">`
+	//      with class `yt-simple-endpoint`). Always present, always SPA-wired,
+	//      and its href is the stable, harmless "/", so the brief window
+	//      between hijack and href-restore can't accidentally point a real
+	//      click at something weird.
+	//   2. Any other guide-entry anchor (mini-guide or full guide).
+	//   3. Any `a.yt-simple-endpoint` with an href.
+	//   4. Last resort: any `<a>` at all.
+	//
+	// Why not "the first <a> on the page": that anchor is almost always a
+	// video-card lockup, which is `rel="nofollow"`, NOT carrying the
+	// `yt-simple-endpoint` class, and NOT wired into YouTube's SPA router.
+	// It has no `.data` property to mutate and no `yt-navigate` to intercept
+	//, clicking it is essentially a no-op. Targeting `yt-simple-endpoint`
+	// gives us the actual SPA-router-wired path.
 
 	const Navigator = {
+		/**
+		 * Tiered list of anchor selectors. Each tier has a human-readable label
+		 * (used in logs to explain *why* a particular anchor was picked) and a
+		 * CSS selector. The first tier that returns a match wins.
+		 *
+		 * Kept as data rather than nested `||` so logs can show which tier
+		 * matched without re-running the queries.
+		 */
+		// The video ID we expect to arrive at after our own goTo() call.
+		// Set immediately before the fake click, cleared by yt-navigate-finish
+		// once it has been read. If yt-navigate-finish fires with a different
+		// video ID while the queue is playing, we know the user navigated
+		// themselves and can stop the queue.
+		_pendingVideoId: null,
+
+		_ANCHOR_TIERS: [
+			// The mini-guide Home entry, first choice. The full attribute match
+			// here is intentionally specific so we don't grab some other random
+			// `id="endpoint"` that ended up SPA-routing somewhere unexpected.
+			['mini-guide Home',           'a.yt-simple-endpoint#endpoint[href="/"]'],
+			// Any guide entry, mini or full. Both reliably SPA-route.
+			['mini-guide entry',          'ytd-mini-guide-entry-renderer a.yt-simple-endpoint[href]'],
+			['full guide entry',          'ytd-guide-entry-renderer a.yt-simple-endpoint[href]'],
+			// Any other SPA-wired anchor. Excludes plain video-card lockups
+			// (those don't carry the yt-simple-endpoint class).
+			['any yt-simple-endpoint',    'a.yt-simple-endpoint[href]'],
+			// Absolute last resort, better than throwing, but unlikely to
+			// SPA-navigate. The href fallback may still rescue this case.
+			['fallback: any anchor',      'a[href]'],
+		],
+
+		/**
+		 * Find a YouTube SPA-routed anchor to hijack. See the block comment
+		 * above and `_ANCHOR_TIERS` for the preference order and reasoning.
+		 *
+		 * Returns `{ anchor, reason, selector }` for the first matching tier,
+		 * or null if NOTHING on the page matches, which would be very
+		 * unusual on a rendered YouTube page.
+		 */
+		_findAnchor() {
+			for (const [reason, selector] of this._ANCHOR_TIERS) {
+				const anchor = document.querySelector(selector);
+				if (anchor) return { anchor, reason, selector };
+			}
+			return null;
+		},
+
+		/**
+		 * Compact, log-friendly description of an anchor: tag, id, classes,
+		 * href, and any human-readable hints (aria-label, title). Returned as
+		 * a plain object so devtools renders it as an expandable tree rather
+		 * than a wall of string.
+		 */
+		_describeAnchor(anchor) {
+			const cls = anchor.className || '';
+			return {
+				tag: anchor.tagName,
+				id: anchor.id || null,
+				classes: cls ? cls.split(/\s+/).filter(Boolean).slice(0, 6) : null,
+				href: anchor.getAttribute('href'),
+				ariaLabel: anchor.getAttribute('aria-label'),
+				title: anchor.getAttribute('title'),
+			};
+		},
+
+		/**
+		 * Compact, log-friendly summary of a YouTube endpoint object. Endpoint
+		 * payloads are large and tracking-blob-heavy; this picks out only the
+		 * fields useful for understanding *what* the endpoint navigates to.
+		 */
+		_summarizeEndpoint(ep) {
+			if (ep == null) return ep;
+			if (typeof ep !== 'object') return ep;
+			const types = Object.keys(ep).filter(k => k.endsWith('Endpoint') || k.endsWith('endpoint'));
+			const out = { _types: types };
+			if (ep.watchEndpoint?.videoId) out.videoId = ep.watchEndpoint.videoId;
+			if (ep.watchEndpoint?.playlistId) out.playlistId = ep.watchEndpoint.playlistId;
+			if (ep.browseEndpoint?.browseId) out.browseId = ep.browseEndpoint.browseId;
+			if (ep.urlEndpoint?.url) out.urlEndpoint = ep.urlEndpoint.url;
+			if (ep.commandMetadata?.webCommandMetadata?.url) out.metadataUrl = ep.commandMetadata.webCommandMetadata.url;
+			if (ep.commandMetadata?.webCommandMetadata?.webPageType) out.webPageType = ep.commandMetadata.webCommandMetadata.webPageType;
+			return out;
+		},
+
 		goTo(url) {
 			const parsed = new URL(url, location.origin);
 			const navPath = parsed.pathname + parsed.search;
 			const expectedId = parsed.searchParams.get('v');
+
+			log('goTo() called, target =', url, '(navPath:', navPath, ', expectedId:', expectedId + ')');
 
 			// Hard guard: if the target URL has no `v=` param there is nothing
 			// to navigate to. Without this, the endpoint mutation below would
@@ -497,59 +765,149 @@
 				return;
 			}
 
-			log('Navigating to:', navPath);
-
-			// Always use YouTube's internal SPA navigation by hijacking any watch anchor
-			// on the page and mutating its yt-navigate endpoint to point at the target.
-			// This works from any page (homepage, search, watch, etc.) and preserves
-			// autoplay — location.href would cause a full reload and break autoplay.
-			const queueIds = new Set(
-				Storage.queue.map(v => getVideoId(v.url)).filter(Boolean)
-			);
-
-			const anchor = [...document.querySelectorAll('a[href*="/watch?v="]')].find(a => {
-				const vid = getVideoId(a.href);
-				return vid && vid !== expectedId && !queueIds.has(vid);
-			});
-
-			if (!anchor) {
-				warn('No hijackable anchor found on this page — cannot navigate to', expectedId);
-				UI.showStatus('No video link found on page to navigate with', 4000);
+			const found = this._findAnchor();
+			if (!found) {
+				// Should be effectively impossible on any rendered YouTube page,
+				// but if there really is no anchor at all there is nothing to
+				// hijack, the "anchor click only" contract has no escape hatch.
+				warn('Navigator.goTo: no SPA anchor (or any <a>) found, cannot navigate to', expectedId);
+				UI.showStatus('No link found on page to navigate with', 4000);
 				return;
 			}
 
+			const { anchor, reason, selector } = found;
+
+			// Loud warning if we landed on the last-resort tier, those anchors
+			// are NOT SPA-wired so navigation will likely fail. Promote this
+			// to warn() (always prints) instead of log() (debug-only) so the
+			// user sees it without needing to enable debug mode first.
+			if (reason.startsWith('fallback')) {
+				warn('Navigator.goTo: had to fall back to a non-SPA anchor, navigation may fail or hard-reload');
+			}
+
+			log('Picked anchor:', { reason, selector, anchor: this._describeAnchor(anchor) });
+			log('Anchor before hijack: .data =', this._summarizeEndpoint(pageCompatGet(anchor, 'data')));
+
+			// The watch-endpoint payload we want YouTube's SPA router to follow.
+			// `webPageType` is what tells the router to render the watch page chrome
+			// rather than treating us as a browse/search/etc. The `rootVe` value is
+			// YouTube's visual-element ID for watch pages, it doesn't matter much
+			// for navigation but matches what real watch endpoints carry, so it
+			// keeps the payload "well-formed" by YouTube's standards.
+			const newEndpoint = {
+				commandMetadata: {
+					webCommandMetadata: {
+						url: navPath,
+						webPageType: 'WEB_PAGE_TYPE_WATCH',
+						rootVe: 3832,
+					},
+				},
+				watchEndpoint: { videoId: expectedId },
+			};
+
+			log('Installing new .data:', this._summarizeEndpoint(newEndpoint));
+
+			// (1) Save the anchor's original href and (2) rewrite to the target.
+			// This is the safety net for non-SPA / hard-nav fallbacks.
+			const originalHref = anchor.getAttribute('href');
+			anchor.setAttribute('href', navPath);
+			log('href hijacked:', originalHref, '→', navPath);
+
+			// (3) PRIMARY hijack: overwrite the anchor's `.data` property.
+			//
+			// `yt-simple-endpoint` anchors carry their navigation target as an
+			// endpoint object on the element's `.data` property. YouTube's Polymer
+			// click handler reads `this.data` directly when the user clicks and
+			// routes off that, it does NOT dispatch a `yt-navigate` event we can
+			// intercept synchronously before the routing decision is made.
+			//
+			// In other words: mutating `.data` IS the navigation-targeting
+			// mechanism. Setting it before the click is the canonical way to
+			// "redirect" a yt-simple-endpoint click.
+			//
+			// On Firefox we have to go through pageCompatSet, which uses
+			// `wrappedJSObject` + `cloneInto` to cross the Xray boundary. On
+			// Chromium it's a plain assignment. The same call works in both.
+			//
+			// The `__ytqm_…` shadow vars stash the originals so cleanup can put
+			// them back; we use unique names to avoid stomping anything else.
+			const hadData = 'data' in anchor;
+			anchor.__ytqm_origData = pageCompatGet(anchor, 'data');
+			anchor.__ytqm_hadData = hadData;
+			let dataSetOk = false;
+			try {
+				pageCompatSet(anchor, 'data', newEndpoint);
+				dataSetOk = true;
+			} catch (e) {
+				warn('Navigator.goTo: could not set anchor.data —', e);
+			}
+			if (dataSetOk) {
+				// Read it back so we can confirm the assignment actually stuck —
+				// useful when something silently coerces or rejects the write.
+				log('.data hijack OK, readback:', this._summarizeEndpoint(pageCompatGet(anchor, 'data')));
+			}
+
+			// (4) Fallback hijack: yt-navigate listener.
+			//
+			// On some YouTube code paths a `yt-navigate` event IS dispatched with
+			// the endpoint in `e.detail.endpoint`, and mutating that object before
+			// it propagates further can also redirect navigation. We keep this as
+			// belt-and-suspenders in case the .data assignment above doesn't take
+			// (e.g., on an older YouTube layout where the property is read-only,
+			// or where some other element handles the click).
 			let mutated = false;
 			const handler = e => {
 				if (!e.detail?.endpoint) return;
 				const ep = e.detail.endpoint;
 				if (!mutated) {
-					log('Mutating yt-navigate endpoint to', expectedId);
+					log('yt-navigate fired, incoming endpoint:', this._summarizeEndpoint(ep));
 					if (ep.watchEndpoint) {
 						ep.watchEndpoint.videoId = expectedId;
 					} else {
 						Object.keys(ep).forEach(k => {
 							if (k.endsWith('Endpoint') || k.endsWith('endpoint')) delete ep[k];
 						});
-						ep.watchEndpoint = {
-							videoId: expectedId
-						};
+						ep.watchEndpoint = { videoId: expectedId };
 					}
 					if (ep.commandMetadata?.webCommandMetadata) ep.commandMetadata.webCommandMetadata.url = navPath;
 					ep.clickTrackingParams = '';
 					mutated = true;
+					log('yt-navigate endpoint mutated to:', this._summarizeEndpoint(ep));
 				} else {
 					log('Blocking duplicate yt-navigate for', ep.watchEndpoint?.videoId);
 					e.stopImmediatePropagation();
 					e.preventDefault();
 				}
 			};
+			window.addEventListener('yt-navigate', handler, { capture: true });
 
-			window.addEventListener('yt-navigate', handler, {
-				capture: true
-			});
-			setTimeout(() => window.removeEventListener('yt-navigate', handler, {
-				capture: true
-			}), 2000);
+			// (5) Cleanup: restore .data and href, remove the listener.
+			// If the click triggered a hard nav, this document is already gone
+			// by the time the timer fires, the closure is harmlessly torn
+			// down with the page.
+			setTimeout(() => {
+				log('Cleanup timer fired, restoring anchor href and .data');
+				window.removeEventListener('yt-navigate', handler, { capture: true });
+				if (originalHref !== null) anchor.setAttribute('href', originalHref);
+				else anchor.removeAttribute('href');
+				try {
+					if (anchor.__ytqm_hadData) pageCompatSet(anchor, 'data', anchor.__ytqm_origData);
+				} catch {}
+				delete anchor.__ytqm_origData;
+				delete anchor.__ytqm_hadData;
+				if (!mutated) {
+					// We never observed a yt-navigate event. That's normal when
+					// the .data hijack alone was enough to redirect the click,
+					// but if navigation also failed it's a useful clue.
+					log('Cleanup: no yt-navigate event was observed during this navigation');
+				}
+			}, NAV_HREF_RESTORE_MS);
+
+			// (6) Fake the click.
+			// Stamp _pendingVideoId so yt-navigate-finish can tell that this
+			// navigation was ours, not the user clicking something themselves.
+			this._pendingVideoId = expectedId;
+			log('Dispatching click() on hijacked anchor');
 			anchor.click();
 		},
 	};
@@ -576,9 +934,11 @@
 			Storage.setPlaying(true);
 			const first = Storage.peekFirst();
 			if (!first) {
+				log('start(), queue is empty, stopping immediately');
 				this.stop();
 				return;
 			}
+			log('start(), queue head:', first.title, '(', getVideoId(first.url), '), total queue length:', Storage.queue.length);
 			UI.updateControls();
 			const currentId = getVideoId(location.href);
 			const expectedId = getVideoId(first.url);
@@ -588,7 +948,7 @@
 				return;
 			}
 			if (currentId === expectedId) {
-				log('Already on the correct page — attaching directly');
+				log('Already on the correct page, attaching directly');
 				this._waitForVideoAndPlay();
 			} else {
 				Navigator.goTo(first.url);
@@ -622,15 +982,18 @@
 		},
 
 		remotePause() {
+			log('remotePause()');
 			Storage.setPaused(true);
 			UI.updateRemotePauseBtn();
 		},
 		remoteResume() {
+			log('remoteResume()');
 			Storage.setPaused(false);
 			UI.updateRemotePauseBtn();
 		},
 
 		remoteSkip() {
+			log('remoteSkip(), playing locally?', this._playing);
 			if (this._playing) {
 				this.skip();
 				return;
@@ -672,7 +1035,7 @@
 				const remaining = video.duration - video.currentTime;
 				const ended = video.ended || (!isNaN(remaining) && remaining <= VIDEO_END_THRESHOLD_S);
 				if (ended) {
-					log('Video ended — advancing queue');
+					log('Video ended, advancing queue');
 					this._userPaused = false;
 					Storage.setPaused(false);
 					this.advance();
@@ -739,15 +1102,15 @@
 			const onResolve = () => {
 				if (this._advancingFromUnavailable) {
 					this._advancingFromUnavailable = false;
-					warn('Video unavailable — skipping to next in queue');
-					UI.showStatus('Video unavailable — skipping…', 3000);
+					warn('Video unavailable, skipping to next in queue');
+					UI.showStatus('Video unavailable, skipping…', 3000);
 					this._skipUnplayable();
 					return;
 				}
 				const video = document.querySelector('video');
 				if (video) this._onVideoReady(video, first);
 				else {
-					warn('No <video> after resolve — skipping to next');
+					warn('No <video> after resolve, skipping to next');
 					this._skipUnplayable();
 				}
 			};
@@ -771,7 +1134,7 @@
 			// silently skip the <video> element), give YouTube a brief grace
 			// period and then advance rather than stalling for the full
 			// NAV_TIMEOUT_MS. Only triggers when we DO have a next video to fall
-			// through to — otherwise let the long fallback run.
+			// through to, otherwise let the long fallback run.
 			const earlyUnavailableTimer = setTimeout(() => {
 				if (resolved) return;
 				if (getVideoId(location.href) !== expectedId) return;
@@ -780,8 +1143,8 @@
 				resolved = true;
 				clearInterval(pollTimer);
 				clearTimeout(fallbackTimer);
-				warn('No <video> element after grace period — assuming unavailable');
-				UI.showStatus('Video unavailable — skipping…', 3000);
+				warn('No <video> element after grace period, assuming unavailable');
+				UI.showStatus('Video unavailable, skipping…', 3000);
 				this._skipUnplayable();
 			}, UNAVAILABLE_CHECK_DELAY_MS);
 
@@ -791,9 +1154,9 @@
 				if (resolved) return;
 				resolved = true;
 				warn('Timed out waiting for <video> after', NAV_TIMEOUT_MS, 'ms');
-				// Try to keep going — only stop if there's truly nothing left.
+				// Try to keep going, only stop if there's truly nothing left.
 				if (Storage.queue.length > 1) {
-					UI.showStatus('Video failed to load — skipping…', 3000);
+					UI.showStatus('Video failed to load, skipping…', 3000);
 					this._skipUnplayable();
 				} else {
 					this.stop();
@@ -854,7 +1217,7 @@
 					once: true
 				});
 			};
-			// Do NOT pause here — calling video.pause() while YouTube is still
+			// Do NOT pause here, calling video.pause() while YouTube is still
 			// initialising its player causes YouTube to show an error screen.
 			whenReady(restartFromBeginning ? seekThenPlay : play);
 		},
@@ -929,7 +1292,7 @@
 				const remaining = video.duration - video.currentTime;
 				if (remaining > 5) return;
 				if (video.ended || remaining <= VIDEO_END_THRESHOLD_S) {
-					log('timeupdate: end threshold reached — advancing');
+					log('timeupdate: end threshold reached, advancing');
 					this._userPaused = false;
 					Storage.setPaused(false);
 					this.advance();
@@ -943,6 +1306,7 @@
 			const current = Storage.shiftQueue();
 			if (current) Storage.pushHistory(current);
 			const next = Storage.peekFirst();
+			log('advance(), leaving:', current?.title || '(none)', '→ next:', next?.title || '(end of queue)');
 			this._attachedVideoId = null;
 			this._navigatingToPrev = false;
 			this._detachVideoListeners();
@@ -952,22 +1316,29 @@
 		},
 
 		skip() {
+			log('skip(), playing?', this._playing);
 			if (this._playing) this.advance();
 		},
 
 		/**
-		 * Hard-reloads the current page (or navigates to `url` if provided) while
-		 * keeping the queue alive.  On boot the refresh-recovery path in tryInit()
-		 * sees playing=true and calls Player.start(), so playback resumes exactly
-		 * as if the queue had just advanced to this video naturally.
+		 * Re-navigate to the front of the queue (or to `url` if provided),
+		 * keeping the queue alive.
 		 *
-		 * If `url` points to a YouTube video that is NOT already at the front of
-		 * the queue, it is spliced in at position 0 so it becomes the next thing
-		 * that plays after the reload.
+		 * Behavioural change in 2.1.0: this now SPA-navigates via Navigator.goTo
+		 * just like every other call site in the script, instead of doing a
+		 * hard reload via location.href / location.reload(). The boot-recovery
+		 * path in tryInit() still fires after a manual page refresh, so the
+		 * queue still survives an explicit Ctrl+R, we just no longer trigger
+		 * one ourselves. The "reload" in the name is now a misnomer kept for
+		 * API stability.
 		 *
-		 * @param {string} [url] - Optional YouTube watch URL or video ID to navigate
-		 *   to instead of reloading the current page.  Pass undefined / omit to
-		 *   simply reload the page the user is already on.
+		 * If `url` points to a YouTube video that is NOT already at the front
+		 * of the queue, it is spliced in at position 0 so it becomes the next
+		 * thing that plays.
+		 *
+		 * @param {string} [url] - Optional YouTube watch URL or bare video ID.
+		 *   Pass undefined / omit to re-navigate to whatever is currently at
+		 *   the front of the queue.
 		 */
 		reloadAndResume(url) {
 			// Resolve a bare video ID ("dQw4w9WgXcQ") to a full watch URL.
@@ -979,16 +1350,16 @@
 			const targetId = targetUrl ? getVideoId(targetUrl) : null;
 			if (targetUrl && !targetId) warn('reloadAndResume: could not parse URL', targetUrl);
 
-			// Ensure the target video is at queue[0] so boot-recovery plays it.
+			// Ensure the target video is at queue[0] so playback lands on it.
 			if (targetId) {
 				Storage.mutate(s => {
 					const existingIdx = s.queue.findIndex(v => getVideoId(v.url) === targetId);
 					if (existingIdx > 0) {
-						// Already in queue but not at the front — move it to position 0.
+						// Already in queue but not at the front, move it to position 0.
 						const [item] = s.queue.splice(existingIdx, 1);
 						s.queue.unshift(item);
 					} else if (existingIdx === -1) {
-						// Not in queue at all — insert it at position 0.
+						// Not in queue at all, insert it at position 0.
 						s.queue.unshift({
 							url: watchUrl(targetId),
 							title: targetId,
@@ -996,26 +1367,52 @@
 							id: _uid()
 						});
 					}
-					// existingIdx === 0 means it is already at the front — nothing to do.
+					// existingIdx === 0 means it is already at the front, nothing to do.
 				});
 			}
 
-			// Stamp playing=true so tryInit() knows to resume after the reload.
+			// Stamp playing=true so a manual refresh of the page would be
+			// recovered by tryInit(). We don't trigger one ourselves anymore.
 			Storage.setPlaying(true);
 
-			log('reloadAndResume: hard reloading', targetUrl || location.href);
-
-			if (targetId) {
-				location.href = watchUrl(targetId);
-			} else {
-				location.reload();
+			// Decide where to navigate. If a target was given, go there.
+			// Otherwise, navigate to the head of the queue.
+			let dest = targetId ? watchUrl(targetId) : null;
+			if (!dest) {
+				const head = Storage.peekFirst();
+				if (!head) {
+					warn('reloadAndResume: queue is empty and no URL given, nothing to do');
+					return;
+				}
+				dest = head.url;
 			}
+
+			// Already on the destination? Just (re)attach the player without
+			// triggering a navigation. This is the case where the old code
+			// would have done a hard reload, we deliberately do NOT anymore.
+			if (getVideoId(location.href) === getVideoId(dest)) {
+				log('reloadAndResume: already on', dest, '— attaching without navigation');
+				if (!this._playing) this.start();
+				else this._waitForVideoAndPlay();
+				return;
+			}
+
+			log('reloadAndResume: SPA navigating to', dest);
+
+			// Same anchor-hijack path as every other navigation in the script.
+			Navigator.goTo(dest);
+
+			// Make sure the player attaches once the SPA navigation lands.
+			// yt-navigate-finish would normally take care of this, but we set
+			// _playing=true defensively so the attach poll fires for the case
+			// where Player wasn't already in the playing state.
+			if (!this._playing) this.start();
 		},
 
 		previous() {
 			if (!this._playing) return;
 			if (this._navigatingToPrev) {
-				log('previous(): navigation already in flight — ignoring');
+				log('previous(): navigation already in flight, ignoring');
 				return;
 			}
 			const prev = Storage.popHistory();
@@ -1109,7 +1506,7 @@
 				return;
 			}
 			// Last resort: synthesise a "k" keypress on the player. We drop the
-			// deprecated `keyCode`/`which` properties — modern browsers route on
+			// deprecated `keyCode`/`which` properties, modern browsers route on
 			// `key` and `code`, and YouTube's own keyboard handler reads `key`.
 			const player = document.querySelector(SEL.PLAYER);
 			if (player) player.dispatchEvent(new KeyboardEvent('keydown', {
@@ -1165,7 +1562,7 @@
 				return {
 					ok: false,
 					added: 0,
-					error: 'Clipboard read failed — check browser permissions.'
+					error: 'Clipboard read failed, check browser permissions.'
 				};
 			}
 
@@ -1176,7 +1573,7 @@
 				return {
 					ok: false,
 					added: 0,
-					error: 'Invalid JSON — could not parse clipboard contents.'
+					error: 'Invalid JSON, could not parse clipboard contents.'
 				};
 			}
 
@@ -1263,7 +1660,7 @@
 				if (!res.ok) return;
 				data = await res.json();
 			} catch {
-				// Server offline or unreachable — silently ignore
+				// Server offline or unreachable, silently ignore
 				return;
 			}
 
@@ -1434,7 +1831,7 @@
 		},
 
 		syncAllButtons() {
-			// Fast path via Storage.isQueued (Set-backed) — avoids cloning the
+			// Fast path via Storage.isQueued (Set-backed), avoids cloning the
 			// queue array AND avoids O(thumbnails * queueLen) for big pages.
 			this._cards.forEach((entry) => {
 				const inQueue = Storage.isQueued(entry.videoUrl);
@@ -1447,7 +1844,7 @@
 		// ── Injection entry points (one per thumbnail variety) ──────────────────
 
 		// Standard grid/list/compact thumbnails. Skips anchors inside
-		// ytd-video-preview — those are owned by _injectVideoPreview so the button
+		// ytd-video-preview, those are owned by _injectVideoPreview so the button
 		// ends up on the outer wrapper, above the inline player in the z-order.
 		_injectStandard(anchor) {
 			if (anchor.nodeType !== Node.ELEMENT_NODE) return;
@@ -1462,7 +1859,7 @@
 		},
 
 		// Inline hover-player wrapper. ytd-video-preview is a singleton element
-		// that YouTube reuses for every thumbnail the pointer enters — the anchor's
+		// that YouTube reuses for every thumbnail the pointer enters, the anchor's
 		// href is updated in place each time. The button is mounted on the outer
 		// vpNode so it survives YouTube swapping ytd-thumbnail for ytd-player.
 		_injectVideoPreview(vpNode) {
@@ -1510,7 +1907,7 @@
 		_handleMutationNode(node) {
 			if (node.nodeType !== Node.ELEMENT_NODE) return;
 
-			// ytd-video-preview first — same ordering reason as _injectAll.
+			// ytd-video-preview first, same ordering reason as _injectAll.
 			if (node.matches('ytd-video-preview')) this._injectVideoPreview(node);
 			node.querySelectorAll('ytd-video-preview').forEach(vp => this._injectVideoPreview(vp));
 
@@ -1528,7 +1925,7 @@
 		},
 
 		// Walks up from a newly-added image element to retry its ancestor anchor.
-		// Anchors inside ytd-video-preview are exempt — the vp handler owns them.
+		// Anchors inside ytd-video-preview are exempt, the vp handler owns them.
 		_retryFromImg(el) {
 			if (el.closest('ytd-video-preview')) return;
 			const anchor = el.closest('a[href*="/watch?v="]');
@@ -1553,7 +1950,7 @@
 			if (!videoId) return;
 			const videoUrl = watchUrl(videoId);
 
-			// Only set position if it is currently static — YouTube sets its own
+			// Only set position if it is currently static, YouTube sets its own
 			// non-static position on elements like ytd-video-preview (fixed/absolute)
 			// and overriding that would break the overlay/hover-trigger mechanism.
 			if (window.getComputedStyle(container).position === 'static') {
@@ -1740,7 +2137,7 @@
 				           svg: '<path d="M9 2V16M2 9H16" stroke="white" stroke-width="2.2" stroke-linecap="round"/>' },
 				added:   { active: true,  tooltip: 'Added!',
 				           svg: '<path d="M3 9.5L7.5 14L15 5" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>' },
-				dupe:    { active: false, tooltip: 'In queue — click to remove',
+				dupe:    { active: false, tooltip: 'In queue, click to remove',
 				           svg: '<path d="M4 4L14 14M14 4L4 14" stroke="white" stroke-width="2.2" stroke-linecap="round"/>' },
 				removed: { active: true,  tooltip: 'Removed from queue',
 				           svg: '<path d="M3 9H15" stroke="white" stroke-width="2.2" stroke-linecap="round"/>' },
@@ -1940,7 +2337,7 @@
         #ytqm-remote-pause-btn.is-paused { background: rgba(39,174,96,0.2); border-color: rgba(39,174,96,0.7); color: #2ecc71; }
         #ytqm-remote-pause-btn.is-paused:hover { background: rgba(39,174,96,0.3); }
         /* Shared close-button style. Both the queue panel and settings modal
-           use this class — see ytqm-panel-close / ytqm-settings-close IDs.
+           use this class, see ytqm-panel-close / ytqm-settings-close IDs.
            Previously both shared the same ID, which is invalid HTML in a
            single shadow root (id is a singleton scope). */
         .ytqm-close-btn { background: #fff; border: 1.5px solid #fff; border-radius: 50%; color: #000; cursor: pointer; font-size: 13px; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; padding: 0; font-family: inherit; flex-shrink: 0; transition: all 0.15s; }
@@ -1954,13 +2351,13 @@
         #ytqm-list::-webkit-scrollbar { width: 5px; }
         #ytqm-list::-webkit-scrollbar-track { background: transparent; }
         #ytqm-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 99px; }
-        /* Items are NOT draggable on the row level — only via the handle.
+        /* Items are NOT draggable on the row level, only via the handle.
            See refreshPanel() for the handle-driven \`draggable\` toggle. */
         .ytqm-item { display: flex; align-items: center; gap: 6px; padding: 9px 14px; transition: background 0.12s; border-radius: 8px; margin: 2px 6px; position: relative; }
         .ytqm-item:hover     { background: rgba(255,255,255,0.07); }
         .ytqm-item.dragging  { opacity: 0.35; }
         /* Drop indicator: 2px line above OR below the hovered item, telling
-           the user exactly where the drop will land — replaces the old single
+           the user exactly where the drop will land, replaces the old single
            ambiguous "drag-over" highlight that covered the whole row. */
         .ytqm-item.drop-above::before,
         .ytqm-item.drop-below::after {
@@ -2341,7 +2738,7 @@
 
 			// Validate that the entered string parses as a URL with an http(s)
 			// protocol. We restrict to http/https to keep the fetch surface
-			// predictable — javascript:, file:, etc. would be unsafe and have
+			// predictable, javascript:, file:, etc. would be unsafe and have
 			// no useful semantics for the phone-poll endpoint.
 			const isValidUrl = (val) => {
 				try {
@@ -2361,7 +2758,7 @@
 			urlInput.addEventListener('change', () => {
 				const v = urlInput.value.trim();
 				if (v && !isValidUrl(v)) {
-					// Reject the change — keep the previous setting and flag the input.
+					// Reject the change, keep the previous setting and flag the input.
 					reflectValidity();
 					warn('Rejected invalid phoneServerUrl:', v);
 					return;
@@ -2408,7 +2805,7 @@
 					count
 				} = await QueueIO.exportToClipboard();
 				if (ok) setIoStatus(`✓ Copied ${count} item${count !== 1 ? 's' : ''} to clipboard`, 'ok');
-				else setIoStatus('✗ Clipboard write failed — check browser permissions', 'err');
+				else setIoStatus('✗ Clipboard write failed, check browser permissions', 'err');
 			});
 
 			const importBtn = document.createElement('button');
@@ -2535,7 +2932,7 @@
 		},
 
 		/**
-		 * Shuffle "remaining" items only — when the queue is playing, queue[0]
+		 * Shuffle "remaining" items only, when the queue is playing, queue[0]
 		 * is the now-playing video and is left in place. Fisher-Yates over the
 		 * tail. We rebuild via Storage.setQueue which goes through mutate, so
 		 * the cross-tab race protections still apply.
@@ -2578,7 +2975,7 @@
 				this.showStatus('Nothing to clear', 2000);
 				return;
 			}
-			// Lightweight confirm — using window.confirm because the panel UI
+			// Lightweight confirm, using window.confirm because the panel UI
 			// doesn't have a custom modal and a destructive action deserves
 			// a deliberate "yes". `window.confirm` works fine in a userscript.
 			if (!window.confirm(`Remove ${removed} item${removed === 1 ? '' : 's'} from the queue?`)) return;
@@ -2726,14 +3123,14 @@
 				// IMPORTANT: item.draggable starts FALSE. We flip it to true on
 				// mousedown of the drag handle, then back to false on dragend or
 				// mouseup. This is the standard pattern for "drag by handle"
-				// using the native HTML5 DnD API — without it, the entire row
+				// using the native HTML5 DnD API, without it, the entire row
 				// would be draggable and the user couldn't select the title text.
 				item.draggable = false;
 				item.dataset.queueIndex = queueIdx;
 
 				// Drag handle (☰).
 				//   • mousedown enables draggable on the parent (drag-by-handle pattern).
-				//   • right-click moves this item to the "next" slot — right after the
+				//   • right-click moves this item to the "next" slot, right after the
 				//     now-playing item when the queue is playing, or to the very front
 				//     when it's not. This matches the right-click-as-Play-Next behaviour
 				//     the thumbnail buttons already use, so the gesture is consistent
@@ -2748,7 +3145,7 @@
 					e.preventDefault();
 					e.stopPropagation();
 					// "Next" = index 1 when something is playing, 0 otherwise.
-					// Bail if the item is already there — no-op avoids a needless
+					// Bail if the item is already there, no-op avoids a needless
 					// storage write and a panel re-render flicker.
 					const targetIdx = playing ? 1 : 0;
 					if (queueIdx === targetIdx) {
@@ -2900,9 +3297,33 @@
 	window.addEventListener('yt-navigate-finish', () => {
 		if (location.href !== lastUrl) notifyUrlChange(location.href);
 		else onUrlChange();
-		if (Player._playing && Page.isWatchPage()) {
-			log('yt-navigate-finish: attaching to video');
-			setTimeout(() => Player._waitForVideoAndPlay(), 300);
+
+		const arrivedId = getVideoId(location.href);
+		const pendingId = Navigator._pendingVideoId;
+
+		// Always clear the pending stamp now that we've landed somewhere —
+		// regardless of whether it matched, so stale stamps don't affect the
+		// next navigation.
+		Navigator._pendingVideoId = null;
+
+		if (Player._playing) {
+			if (pendingId && pendingId === arrivedId) {
+				// This is a navigation WE triggered. Normal queue advance path.
+				log('yt-navigate-finish: arrived at expected video', arrivedId, '— attaching');
+				setTimeout(() => Player._waitForVideoAndPlay(), 300);
+			} else {
+				// Either:
+				//   a) pendingId is null  — no navigation was in flight from our
+				//      side, so the user must have clicked something themselves.
+				//   b) pendingId exists but doesn't match arrivedId — the user
+				//      clicked a different video while our navigation was still
+				//      pending (e.g. double-clicked, or very fast interaction).
+				// In both cases, the user is overriding the queue. Stop.
+				warn('yt-navigate-finish: user-initiated navigation detected',
+					'(expected:', pendingId || 'none', '/ arrived:', arrivedId + ') — stopping queue');
+				Player.stop();
+				UI.showStatus('Queue stopped — you navigated away', 4000);
+			}
 		}
 	});
 
@@ -2973,9 +3394,9 @@
 	//     fine when the page has focus and not the chrome).
 	//
 	// Bindings (Alt-prefixed):
-	//   Alt+Q  — toggle add/remove current video to queue (watch pages only)
-	//   Alt+N  — skip to next item in queue (queue must be playing)
-	//   Alt+P  — go to previous item via history (queue must be playing)
+	//   Alt+Q , toggle add/remove current video to queue (watch pages only)
+	//   Alt+N , skip to next item in queue (queue must be playing)
+	//   Alt+P , go to previous item via history (queue must be playing)
 	//
 	// The handler bails out when the user is typing in an input/textarea/
 	// contenteditable element, so it never eats characters in the search box,
@@ -2992,7 +3413,7 @@
 		_onKeyDown(e) {
 			if (!Settings.get().keyboardShortcuts) return;
 
-			// Require Alt only — reject other modifier combinations so we
+			// Require Alt only, reject other modifier combinations so we
 			// don't fire when the user is doing browser-level shortcuts like
 			// Ctrl+Alt+Q (some accessibility tools use those).
 			if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
@@ -3039,6 +3460,11 @@
 			setTimeout(tryInit, 100);
 			return;
 		}
+		// Always-on banner, prints regardless of DEBUG. Confirms the script
+		// loaded, shows the version (so you can verify a Tampermonkey reload
+		// actually picked up your edits), and reminds you how to flip the
+		// debug flag if you want the verbose logs.
+		console.info(LOG_PREFIX, `v${VERSION} loaded. Verbose logging is ${DEBUG ? 'ON' : 'OFF'}, localStorage.setItem('ytqm_debug', true|false).`);
 		log('Initialising…');
 		try {
 			localStorage.setItem('ytqm_test', '1');
@@ -3052,7 +3478,7 @@
 				position: 'fixed',
 				bottom: '24px',
 				left: '20px',
-				zIndex: '2147483647', // sit above YouTube's chrome — was '1' which got buried
+				zIndex: '2147483647', // sit above YouTube's chrome, was '1' which got buried
 				background: '#c0392b',
 				color: '#fff',
 				padding: '8px 14px',
@@ -3075,10 +3501,10 @@
 
 		// Recover playback state after a page refresh. If the playing flag was
 		// persisted but Player._playing is false (it's always false on boot),
-		// a refresh happened mid-queue — resume from where we left off.
+		// a refresh happened mid-queue, resume from where we left off.
 		const _bootState = Storage.load();
 		if (_bootState.playing && _bootState.queue.length > 0) {
-			log('Resuming queue after page refresh — queue has', _bootState.queue.length, 'items.');
+			log('Resuming queue after page refresh, queue has', _bootState.queue.length, 'items.');
 			Player.start();
 		}
 
@@ -3093,27 +3519,30 @@
 	// other userscripts / bookmarklets without digging into the closure.
 	//
 	//   window.ytQueueManager.reloadAndResume()
-	//     Hard-reloads the current page; queue resumes automatically on boot.
+	//     SPA-navigates to the front of the queue and ensures playback resumes.
+	//     Note: as of 2.1.0 this no longer triggers a hard page reload, the
+	//     name is kept for API compatibility but it now uses Navigator.goTo
+	//     like every other navigation in the script.
 	//
 	//   window.ytQueueManager.reloadAndResume('https://www.youtube.com/watch?v=XYZ')
 	//   window.ytQueueManager.reloadAndResume('XYZ')
-	//     Navigates to the given video (full URL or bare video ID) with a hard
-	//     load, splicing it to the front of the queue if needed, then resumes.
+	//     Splices the given video to the front of the queue (if not already
+	//     there) and SPA-navigates to it.
 	//
 	//   window.ytQueueManager.setDebug(true|false)
-	//     Toggle verbose [YT-Queue] logging at runtime. The choice is persisted
+	//     Toggle verbose [YT-Q] logging at runtime. The choice is persisted
 	//     to localStorage under DEBUG_KEY so it survives page reloads.
 	//
 	//   window.ytQueueManager.getState()
 	//     Snapshot of the current queue/history/flags, useful for inspection
-	//     or debugging — returns a plain object, not a live reference.
+	//     or debugging, returns a plain object, not a live reference.
 	//
 	//   window.ytQueueManager.version
 	//     The userscript @version string, surfaced for sanity-checking which
 	//     build is actually running on a page.
 	//
 	window.ytQueueManager = {
-		version: '2.0.0',
+		version: VERSION,
 		reloadAndResume: (url) => Player.reloadAndResume(url),
 		setDebug: (on) => {
 			DEBUG = !!on;
