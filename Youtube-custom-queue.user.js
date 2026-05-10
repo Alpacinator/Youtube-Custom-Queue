@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name YouTube Queue Manager
 // @namespace https://github.com/Alpacinator/Youtube-Custom-Queue/
-// @version 2.1.0
+// @version 2.1.8
 // @description A persistent, cross-tab YouTube queue manager with drag-to-reorder, auto-advance, and optional auto theater mode.
 // @match *://*.youtube.com/*
 // @grant none
@@ -9,129 +9,6 @@
 // ==/UserScript==
 
 /**
- * ─────────────────────────────────────────────────────────────────────────────
- *  CHANGELOG, 2.1.0
- * ─────────────────────────────────────────────────────────────────────────────
- *  Navigation overhaul:
- *    • All in-script navigation now funnels through a single Navigator.goTo().
- *      Every call site that previously used location.href, location.reload(),
- *      or a direct anchor search now goes through this one entry point.
- *
- *    • Navigator hijacks a YouTube SPA-wired anchor (a.yt-simple-endpoint)
- *      rather than the first <a> in the DOM. Video-card lockup anchors have
- *      rel="nofollow", carry no .data property, and are not wired to
- *      YouTube’s SPA router — clicking them does nothing useful. SPA-wired
- *      anchors are selected in preference order:
- *        1. Mini-guide “Home” entry  (a.yt-simple-endpoint#endpoint[href="/"])
- *        2. Any other mini-guide or full-guide entry
- *        3. Any a.yt-simple-endpoint
- *        4. Last resort: any <a> (warns; unlikely to SPA-navigate)
- *
- *    • Three-layer hijack fires from a single anchor.click():
- *        1. href rewrite — sets anchor.href to the target /watch?v=ID so
- *           that a hard-nav fallback lands on the right page.
- *        2. .data mutation (PRIMARY) — overwrites the anchor’s .data
- *           property with a fresh watchEndpoint before the click. YouTube’s
- *           Polymer click handler reads .data synchronously; mutating it
- *           is the canonical way to redirect a yt-simple-endpoint click.
- *        3. yt-navigate listener (FALLBACK) — a one-shot capture-phase
- *           handler that mutates e.detail.endpoint on the rare code paths
- *           that do dispatch the event.
- *      After NAV_HREF_RESTORE_MS (2 s) the href and .data are restored so
- *      the DOM is not left permanently mutated.
- *
- *    • Firefox compatibility: .data assignment across the Xray compartment
- *      boundary threw "Not allowed to define cross-origin object as property
- *      on XrayWrapper". Fixed via two helpers — pageCompatSet(el, prop, val)
- *      and pageCompatGet(el, prop) — that on Firefox use cloneInto() and
- *      wrappedJSObject to cross the boundary, and are plain pass-throughs on
- *      Chromium.
- *
- *    • Player.reloadAndResume() no longer does a hard reload via
- *      location.href / location.reload(). It routes through Navigator.goTo()
- *      like everything else. Calling it while already on the target video
- *      is a no-op + reattach rather than a full refresh.
- *
- *  Stop queue on user navigation:
- *    • Navigator.goTo() stamps Navigator._pendingVideoId with the expected
- *      destination video ID immediately before firing the fake click.
- *    • The yt-navigate-finish listener reads and clears that stamp on every
- *      navigation. If the queue is playing and the arrived video ID does not
- *      match _pendingVideoId (or _pendingVideoId is null, meaning no
- *      navigation was in flight from our side), the user navigated
- *      themselves — the queue stops and shows "Queue stopped — you
- *      navigated away".
- *    • Does NOT stop the queue on hard reloads (yt-navigate-finish doesn’t
- *      fire; tryInit() recovers via the persisted playing flag) or on
- *      browser back/forward (popstate path, not yt-navigate-finish).
- *
- *  Diagnostics:
- *    • Always-on boot banner printed via console.info on every page load,
- *      regardless of the DEBUG flag:
- *        [YT-Q] v2.1.0 loaded. Verbose logging is OFF — toggle with
- *        window.ytQueueManager.setDebug(true|false).
- *    • Log prefix is [YT-Q] (no dash). Chrome DevTools treats a leading
- *      hyphen in filter tokens as a NOT operator, so "yt-q" would silently
- *      exclude every line. Filter for YT-Q (no quotes needed) to see all
- *      output from this script.
- *    • Verbose logging (enabled via window.ytQueueManager.setDebug(true)
- *      or localStorage.setItem(‘ytqm_debug’, ‘1’)) now covers:
- *        – Player.start / stop / advance / skip / remotePause / remoteResume
- *        – Navigator: which anchor tier was picked and why, the anchor’s
- *          full description, the endpoint on .data before and after the
- *          hijack, the href rewrite, .data write success + readback,
- *          whether yt-navigate fired, cleanup-timer events.
- *    • Single VERSION constant drives both the boot banner and
- *      window.ytQueueManager.version; only @version in the metadata header
- *      needs a separate bump (Tampermonkey reads it before JS runs).
- *
- *  See 2.0.0 changelog (below) for prior changes.
- * ─────────────────────────────────────────────────────────────────────────────
- *  CHANGELOG, 2.0.0
- * ─────────────────────────────────────────────────────────────────────────────
- *  Bug fixes:
- *    • Removed dead `_pendingSeekToStart` branch in Player (never set true).
- *    • Renamed duplicated `id="ytqm-close-btn"` (panel/settings now distinct).
- *    • Unavailable / age-restricted / deleted videos now SKIP rather than
- *      stalling for the full NAV_TIMEOUT_MS and stopping the entire queue.
- *    • Navigator.goTo now bails early when `expectedId` is null instead of
- *      mutating endpoints with a null videoId.
- *    • _clickPlayButton no longer relies on deprecated `keyCode`.
- *    • Cross-tab write race narrowed: every Storage mutation re-reads the
- *      latest state from localStorage immediately before mutating, so two
- *      tabs adding videos in quick succession no longer silently overwrite
- *      each other (residual race exists only within a single event-loop tick).
- *    • _uid() now uses crypto.randomUUID() when available (no collisions).
- *    • Error pill on storage failure now uses a sane z-index so it isn't
- *      hidden behind YouTube's own UI.
- *    • Phone server URL is validated; invalid input shows a red border.
- *
- *  Performance:
- *    • Thumbnail buttons now style themselves via shared classes in a single
- *      <style> tag instead of ~25 inline-style assignments per button.
- *    • syncAllButtons() consults a cached Set of queued URLs, so hover state
- *      sync is O(thumbnails) instead of O(thumbnails * queueLen).
- *    • Player end detection adds a `timeupdate` listener so we don't depend
- *      solely on the 1-second polling fallback.
- *    • All log()/warn() calls are gated behind a debug flag; quiet by default.
- *    • Page.isWatchPage() memoises by URL.
- *
- *  UX:
- *    • Optional keyboard shortcuts: Alt+Q to add/remove current video,
- *      Alt+N to skip, Alt+P to go to previous (skipped when typing in inputs).
- *    • "Clear queue" and "Shuffle remaining" buttons in the queue panel.
- *    • Drag handle (☰) on each queue item; whole-item drag is gone, so
- *      titles can now be selected/copied without triggering a drag.
- *    • Drop indicator shows whether the dragged item lands ABOVE or BELOW
- *      the hover target, instead of a single ambiguous highlight.
- *    • History capacity raised from 10 → 50.
- *
- *  Internal:
- *    • New helper `getVideoId(url)` replaces ~10 ad-hoc URL-parse blocks.
- *    • Storage now exposes a `mutate(fn)` helper; addVideo/removeVideo/etc.
- *      use it, eliminating the load/mutate/save/_invalidate boilerplate.
- *    • Storage._invalidate() is no longer needed externally, kept for the
- *      cross-tab `storage` event listener only.
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * YouTube Queue Manager
@@ -181,7 +58,7 @@
 	// metadata at the top of this file; both must be bumped together. The
 	// public API exposes this as window.ytQueueManager.version, and the boot
 	// banner prints it so users can verify which build is actually running.
-	const VERSION = '2.1.0';
+	const VERSION = '2.1.8';
 
 	const STORAGE_KEY = 'yt_queue_manager_v1';
 	const PLAYING_KEY = 'yt_queue_playing_tab';
@@ -674,13 +551,6 @@
 		 * Kept as data rather than nested `||` so logs can show which tier
 		 * matched without re-running the queries.
 		 */
-		// The video ID we expect to arrive at after our own goTo() call.
-		// Set immediately before the fake click, cleared by yt-navigate-finish
-		// once it has been read. If yt-navigate-finish fires with a different
-		// video ID while the queue is playing, we know the user navigated
-		// themselves and can stop the queue.
-		_pendingVideoId: null,
-
 		_ANCHOR_TIERS: [
 			// The mini-guide Home entry, first choice. The full attribute match
 			// here is intentionally specific so we don't grab some other random
@@ -904,9 +774,6 @@
 			}, NAV_HREF_RESTORE_MS);
 
 			// (6) Fake the click.
-			// Stamp _pendingVideoId so yt-navigate-finish can tell that this
-			// navigation was ours, not the user clicking something themselves.
-			this._pendingVideoId = expectedId;
 			log('Dispatching click() on hijacked anchor');
 			anchor.click();
 		},
@@ -1741,7 +1608,7 @@
 					position: absolute;
 					top: 8px;
 					left: 8px;
-					z-index: 9999;
+					z-index: 2147483646;
 					width: 36px;
 					height: 36px;
 					border-radius: 50%;
@@ -1843,35 +1710,32 @@
 
 		// ── Injection entry points (one per thumbnail variety) ──────────────────
 
-		// Standard grid/list/compact thumbnails. Skips anchors inside
-		// ytd-video-preview, those are owned by _injectVideoPreview so the button
-		// ends up on the outer wrapper, above the inline player in the z-order.
+		// Standard grid/list/compact thumbnails. The button is mounted on the
+		// card-level container (yt-lockup-view-model, ytd-rich-item-renderer,
+		// etc.) rather than on ytd-thumbnail. This is what eliminates the 2.1.7
+		// duplicate-button bug, when YouTube's singleton ytd-video-preview
+		// overlays the thumbnail on hover, the button stays on the card and
+		// renders ON TOP of vpNode via z-index, instead of needing a second
+		// button mounted on vpNode that travels with it across cards.
+		//
+		// Anchors that have no card ancestor (player UI: ytp-title-link, the
+		// autonav up-next link, share-panel links, etc.) are skipped, the
+		// closest(SEL.CARD) miss is the signal that we're not looking at a
+		// real card.
 		_injectStandard(anchor) {
 			if (anchor.nodeType !== Node.ELEMENT_NODE) return;
-			if (anchor.closest('ytd-video-preview')) return;
 			if (!anchor.matches('a[href*="/watch?v="]')) return;
 			if (!this._hasThumbnailContent(anchor)) return;
 			if (anchor.dataset.ytqmInjected) return;
-			const container = anchor.closest('ytd-thumbnail') ?? anchor.parentElement ?? anchor;
+			const card = anchor.closest(SEL.CARD);
+			if (!card) return; // anchor lives in player chrome, not a card, skip
 			anchor.dataset.ytqmInjected = '1';
-			const card = anchor.closest(SEL.CARD) ?? anchor;
-			this._injectButton(anchor, container, card);
-		},
-
-		// Inline hover-player wrapper. ytd-video-preview is a singleton element
-		// that YouTube reuses for every thumbnail the pointer enters, the anchor's
-		// href is updated in place each time. The button is mounted on the outer
-		// vpNode so it survives YouTube swapping ytd-thumbnail for ytd-player.
-		_injectVideoPreview(vpNode) {
-			if (vpNode.dataset.ytqmVpInjected) return;
-			const anchor = vpNode.querySelector('a[href*="/watch?v="]');
-			if (!anchor) return;
-			vpNode.dataset.ytqmVpInjected = '1';
-
-			const outerCard = vpNode.closest(SEL.CARD);
-			if (outerCard?.querySelector('.ytqm-thumb-add-btn')) return;
-
-			this._injectButton(anchor, vpNode, vpNode);
+			// Multiple anchors per card are common (image link + title link both
+			// pointing at /watch?v=…). The first to arrive injects the button,
+			// subsequent ones short-circuit here. _injectButton has its own
+			// deep-search guard as a belt-and-braces backup.
+			if (card.querySelector('.ytqm-thumb-add-btn')) return;
+			this._injectButton(anchor, card, card);
 		},
 
 		// End-of-video suggestion wall tiles. Anchor serves as both container
@@ -1883,11 +1747,7 @@
 
 		// ── Initial sweep + MutationObserver ────────────────────────────────────
 
-		// Sweeps the current DOM. ytd-video-preview nodes are processed first so
-		// _ytqmVpInjected is set before the anchor sweep, preventing the inner
-		// anchor from also being picked up by _injectStandard.
 		_injectAll() {
-			document.querySelectorAll('ytd-video-preview').forEach(vp => this._injectVideoPreview(vp));
 			document.querySelectorAll('a[href*="/watch?v="]').forEach(a => this._injectStandard(a));
 			document.querySelectorAll(SEL.VIDEOWALL_ANCHOR).forEach(a => this._injectVideowall(a));
 		},
@@ -1907,10 +1767,6 @@
 		_handleMutationNode(node) {
 			if (node.nodeType !== Node.ELEMENT_NODE) return;
 
-			// ytd-video-preview first, same ordering reason as _injectAll.
-			if (node.matches('ytd-video-preview')) this._injectVideoPreview(node);
-			node.querySelectorAll('ytd-video-preview').forEach(vp => this._injectVideoPreview(vp));
-
 			// Standard anchors and videowall tiles.
 			this._injectStandard(node);
 			node.querySelectorAll('a[href*="/watch?v="]').forEach(a => this._injectStandard(a));
@@ -1925,9 +1781,7 @@
 		},
 
 		// Walks up from a newly-added image element to retry its ancestor anchor.
-		// Anchors inside ytd-video-preview are exempt, the vp handler owns them.
 		_retryFromImg(el) {
-			if (el.closest('ytd-video-preview')) return;
 			const anchor = el.closest('a[href*="/watch?v="]');
 			if (anchor && !anchor.dataset.ytqmInjected) this._injectStandard(anchor);
 		},
@@ -1944,7 +1798,9 @@
 		_injectButton(anchor, container, card, isVideowall = false) {
 			// Hard guard: never place two buttons in the same container regardless
 			// of which injection path fired or what order mutations arrived in.
-			if (container.children && [...container.children].some(el => el.classList.contains('ytqm-thumb-add-btn'))) return;
+			// Deep search rather than direct-children-only, the button can sit
+			// nested arbitrarily deep when container is the card.
+			if (container.querySelector('.ytqm-thumb-add-btn')) return;
 
 			const videoId = getVideoId(anchor.getAttribute('href') || '');
 			if (!videoId) return;
@@ -2173,36 +2029,64 @@
 			// `mouseenter`/`mouseleave` don't bubble but DO fire during capture
 			// because the dispatch path passes through document on the way to
 			// the target.
+			//
+			// Resolution order:
+			//   1. closest(CARD) — direct hit, the cursor is on a card.
+			//   2. closest(VIDEO_PREVIEW) → URL match — vpNode is the singleton
+			//      inline-player overlay, NOT a DOM descendant of the card it
+			//      visually covers, so closest(CARD) misses. Match by the URL
+			//      vpNode's anchor currently points at instead, that's the
+			//      video the user is hovering on.
+			//   3. closest('.ytp-suggestion-set') — end-of-video wall tile.
+			const findEntry = (target) => {
+				const card = target.closest?.(SEL.CARD);
+				if (card) {
+					const e = this._cards.get(card);
+					if (e) return { card, entry: e };
+				}
+				const vp = target.closest?.(SEL.VIDEO_PREVIEW);
+				if (vp) {
+					const a = vp.querySelector('a[href*="/watch?v="]');
+					const id = a && getVideoId(a.getAttribute('href') || '');
+					if (id) {
+						const url = watchUrl(id);
+						for (const [c, e] of this._cards) {
+							if (e.videoUrl === url) return { card: c, entry: e };
+						}
+					}
+				}
+				const sugg = target.closest?.('.ytp-suggestion-set');
+				if (sugg) {
+					const e = this._cards.get(sugg);
+					if (e) return { card: sugg, entry: e };
+				}
+				return null;
+			};
+
 			document.addEventListener('mouseenter', e => {
-				const card = e.target.closest?.(SEL.CARD) ||
-					e.target.closest?.(SEL.VIDEO_PREVIEW) ||
-					e.target.closest?.('.ytp-suggestion-set');
-				if (!card) return;
-				const entry = this._cards.get(card);
-				if (!entry) return;
-				clearTimeout(entry.hideTimer);
-				entry.hideTimer = null;
-				entry.btn.classList.add('ytqm-visible');
+				const hit = findEntry(e.target);
+				if (!hit) return;
+				clearTimeout(hit.entry.hideTimer);
+				hit.entry.hideTimer = null;
+				hit.entry.btn.classList.add('ytqm-visible');
 			}, true);
 
 			document.addEventListener('mouseleave', e => {
-				const card = e.target.closest?.(SEL.CARD) ||
-					e.target.closest?.(SEL.VIDEO_PREVIEW) ||
-					e.target.closest?.('.ytp-suggestion-set');
-				if (!card) return;
+				const hit = findEntry(e.target);
+				if (!hit) return;
 				const rel = e.relatedTarget;
-				// Don't hide if the cursor moved to a child of the same card.
-				if (
-					rel?.closest?.(SEL.CARD) === card ||
-					rel?.closest?.(SEL.VIDEO_PREVIEW) === card ||
-					rel?.closest?.('.ytp-suggestion-set') === card
-				) return;
-				const entry = this._cards.get(card);
-				if (!entry || entry.hideTimer) return;
-				entry.hideTimer = setTimeout(() => {
-					entry.btn.classList.remove('ytqm-visible');
-					entry.tooltip.style.opacity = '0';
-					entry.hideTimer = null;
+				// Don't hide if the cursor moved to something that resolves to
+				// the same card (e.g. cursor moved from card metadata onto vpNode
+				// overlaying the same thumbnail, or vice-versa).
+				if (rel) {
+					const relHit = findEntry(rel);
+					if (relHit && relHit.card === hit.card) return;
+				}
+				if (hit.entry.hideTimer) return;
+				hit.entry.hideTimer = setTimeout(() => {
+					hit.entry.btn.classList.remove('ytqm-visible');
+					hit.entry.tooltip.style.opacity = '0';
+					hit.entry.hideTimer = null;
 				}, THUMBNAIL_HIDE_DELAY_MS);
 			}, true);
 		},
@@ -3297,33 +3181,9 @@
 	window.addEventListener('yt-navigate-finish', () => {
 		if (location.href !== lastUrl) notifyUrlChange(location.href);
 		else onUrlChange();
-
-		const arrivedId = getVideoId(location.href);
-		const pendingId = Navigator._pendingVideoId;
-
-		// Always clear the pending stamp now that we've landed somewhere —
-		// regardless of whether it matched, so stale stamps don't affect the
-		// next navigation.
-		Navigator._pendingVideoId = null;
-
-		if (Player._playing) {
-			if (pendingId && pendingId === arrivedId) {
-				// This is a navigation WE triggered. Normal queue advance path.
-				log('yt-navigate-finish: arrived at expected video', arrivedId, '— attaching');
-				setTimeout(() => Player._waitForVideoAndPlay(), 300);
-			} else {
-				// Either:
-				//   a) pendingId is null  — no navigation was in flight from our
-				//      side, so the user must have clicked something themselves.
-				//   b) pendingId exists but doesn't match arrivedId — the user
-				//      clicked a different video while our navigation was still
-				//      pending (e.g. double-clicked, or very fast interaction).
-				// In both cases, the user is overriding the queue. Stop.
-				warn('yt-navigate-finish: user-initiated navigation detected',
-					'(expected:', pendingId || 'none', '/ arrived:', arrivedId + ') — stopping queue');
-				Player.stop();
-				UI.showStatus('Queue stopped — you navigated away', 4000);
-			}
+		if (Player._playing && Page.isWatchPage()) {
+			log('yt-navigate-finish: attaching to video');
+			setTimeout(() => Player._waitForVideoAndPlay(), 300);
 		}
 	});
 
