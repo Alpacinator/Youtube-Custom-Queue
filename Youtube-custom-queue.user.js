@@ -1,12 +1,131 @@
 // ==UserScript==
 // @name YouTube Queue Manager
 // @namespace https://github.com/Alpacinator/Youtube-Custom-Queue/
-// @version 2.1.8
+// @version 2.2.0
 // @description A persistent, cross-tab YouTube queue manager with drag-to-reorder, auto-advance, and optional auto theater mode.
 // @match *://*.youtube.com/*
 // @grant none
 // @run-at document-start
 // ==/UserScript==
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * CHANGELOG
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * 2.2.0 (vs 2.1.8)
+ * -----------------
+ *
+ * NEW FEATURES
+ *
+ *   Hide Shorts  (settings toggle, default ON)
+ *     Injects a single CSS rule that hides Shorts from every surface:
+ *     search results (ytd-video-renderer), home/subscriptions grid cards
+ *     (ytd-rich-item-renderer), compact list cards, grid shelf rows
+ *     (grid-shelf-view-model), dedicated Shorts shelves
+ *     (ytd-reel-shelf-renderer), the section wrappers around those shelves,
+ *     and both the mini-guide and full sidebar Shorts navigation entries.
+ *     Toggle off in settings to restore them instantly.
+ *
+ *   oEmbed title fetch on phone share
+ *     When a video URL shared from the phone arrives without a title (e.g.
+ *     a bare-URL share), the title is now fetched from YouTube's public
+ *     oEmbed endpoint (youtube.com/oembed?url=…&format=json) before the
+ *     entry is added to the queue. Works on www.youtube.com (same-origin,
+ *     no CORS issue). Falls back silently to "Shared from phone" on any
+ *     error (timeout, 401 for private/age-gated videos, network failure).
+ *
+ *   Navigator documentation
+ *     Extensive block comment added to the Navigator module explaining why
+ *     anchor-hijacking was chosen over the obvious alternatives (YouTube's
+ *     internal API, dispatching yt-navigate directly, history.pushState),
+ *     and exactly why each of those alternatives doesn't work reliably.
+ *
+ * BUG FIXES
+ *
+ *   Zombie _waitForVideo timers (was: queue advances after manual stop)
+ *     _waitForVideo scheduled three timers (poll interval, 30s fallback,
+ *     early-unavailable check) that lived only in closure scope. Player.stop()
+ *     had no reference to them and couldn't cancel them. 30 seconds after a
+ *     manual stop, the fallback timer would fire, call _skipUnplayable(), and
+ *     advance the queue — visibly navigating to the "next" video even though
+ *     the queue was stopped. Fixed by stashing all three handles on
+ *     this._waitForVideoHandles and clearing them in stop(). Every callback
+ *     also re-checks this._playing before acting.
+ *
+ *   Zombie end-poll timer (was: next video silently skipped without playing)
+ *     advance() and _skipUnplayable() detached event listeners but never
+ *     cleared the end-poll setTimeout. The old video's ended flag stayed true
+ *     on the reused <video> element, so if the 1-second poll fired before the
+ *     new video's _attachVideoListeners had a chance to call _clearEndPoll,
+ *     the orphan timer called advance() again — pushing the next entry into
+ *     history and navigating past it without it ever playing. Fixed by calling
+ *     _clearEndPoll() in both advance() and _skipUnplayable().
+ *
+ *   Queue not stopping on navigate-away
+ *     Navigating off a watch page while the queue was playing (clicking the
+ *     YouTube logo, going to subscriptions, etc.) left Player._playing = true
+ *     with no video to attach to. The queue never stopped on its own; the
+ *     stop button was the only exit. Fixed in onUrlChange(): if _playing is
+ *     true and the new URL is not a watch page, Player.stop() is called.
+ *
+ *   Boot-recovery false positives (was: new tab stole playback from another)
+ *     Boot recovery checks Storage.playing and resumes if true. Storage.playing
+ *     is a shared localStorage flag set by any tab that starts the queue and
+ *     cleared only by stop(). A new tab opening while another tab was playing
+ *     would see playing=true, call Player.start(), steal ownership, and
+ *     forcibly navigate itself to the queue head. Fixed by also requiring the
+ *     boot URL to match the queue head's video ID — the unambiguous "user
+ *     refreshed mid-queue on the watch page" signal.
+ *
+ *   Thumbnail buttons missing on search results
+ *     Buttons were injected onto ytd-video-renderer (the SEL.CARD match for
+ *     search results), which is a Polymer custom element. Polymer's shady-DOM
+ *     rendering swallows children appended from outside the component, giving
+ *     them a 0×0 getBoundingClientRect and making them invisible. Fixed by
+ *     changing the container argument in _injectStandard from card to anchor:
+ *     _injectButton(anchor, anchor, card). The thumbnail anchor is a plain
+ *     <a> tag that is reliable across all layouts. card is still passed as the
+ *     third argument so hover tracking and the _cards map are unchanged.
+ *
+ *   Overlay button blocked by stacking context on search results
+ *     The body-level overlay button was added to solve the z-index issue where
+ *     YouTube's singleton inline-preview (ytd-video-preview / vpNode) covered
+ *     the card-mounted button. But on search pages, certain ancestor elements
+ *     create a sealed stacking context that traps position:fixed elements in
+ *     the body context rather than the viewport — so vpNode still won.
+ *     Fixed by reparenting the overlay button into #video-preview (vpNode's
+ *     grandparent), putting it in vpNode's own stacking context where a high
+ *     z-index reliably wins. A MutationObserver handles the case where
+ *     #video-preview doesn't exist yet at boot. Positioning uses a probe
+ *     (set left:0/top:0, read actual rect, subtract) to handle transformed
+ *     containing blocks where position:fixed is relative to the ancestor
+ *     rather than the viewport.
+ *
+ *   Overlay and card button rendering simultaneously (visible doubling)
+ *     Both the per-card button and the overlay button were visible at the
+ *     same position on most layouts, causing subtle doubling from box-shadow
+ *     rendering differences. Fixed by toggling html.ytqm-overlay-active when
+ *     the overlay is shown, which suppresses all per-card buttons via CSS.
+ *     The per-card buttons still exist as state holders and forwarding targets.
+ *
+ *   Button flash-and-disappear on vpNode activation (especially first-column)
+ *     When YouTube's inline preview activated, the button would briefly flash
+ *     then disappear. Root cause: mouseleave fired on the card when vpNode
+ *     appeared on top; the relatedTarget was inside vpNode but vpNode's href
+ *     wasn't loaded yet (async), so the URL-match fallback in findEntry
+ *     returned null; the hide timer fired and hid the overlay. For first-
+ *     column / edge cards, vpNode is sometimes offset from the card (to avoid
+ *     overflowing off-screen left), creating a brief cursor gap that could
+ *     also trigger the hide timer before the cursor reached vpNode.
+ *     Fixed with two additions to the hover handlers:
+ *       mouseleave: explicitly check rel.closest(SEL.VIDEO_PREVIEW) and
+ *         return early regardless of URL-match state.
+ *       mouseenter: if target is inside vpNode and _currentHoverCard has a
+ *         pending hide timer, cancel it — handles the cursor-gap scenario.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
 
 /**
  * ─────────────────────────────────────────────────────────────────────────────
@@ -58,7 +177,7 @@
 	// metadata at the top of this file; both must be bumped together. The
 	// public API exposes this as window.ytQueueManager.version, and the boot
 	// banner prints it so users can verify which build is actually running.
-	const VERSION = '2.1.8';
+	const VERSION = '2.2.0';
 
 	const STORAGE_KEY = 'yt_queue_manager_v1';
 	const PLAYING_KEY = 'yt_queue_playing_tab';
@@ -107,6 +226,7 @@
 		enqueueFromPhone: false,
 		phoneServerUrl: 'http://localhost/poll',
 		keyboardShortcuts: true, // Alt+Q / Alt+N / Alt+P (see KeyboardShortcuts module)
+		hideShorts: true,        // hide Shorts cards, shelves, and nav entries
 	};
 
 	const SEL = {
@@ -499,7 +619,83 @@
 	// Single navigation entry point for the entire script. Every place that
 	// wants to change which video the user is on calls Navigator.goTo(url).
 	//
-	// Strategy: hijack a YouTube SPA-wired anchor (an `a.yt-simple-endpoint`),
+	// ── Why anchor-hijacking and not YouTube's internal API? ──────────────────
+	//
+	// The obvious alternative — calling YouTube's own router directly — was
+	// investigated and ruled out for the following reasons:
+	//
+	// 1. THERE IS NO STABLE INTERNAL NAVIGATION FUNCTION.
+	//
+	//    YouTube's SPA is built on Polymer/LitElement. Its "router" is not a
+	//    centrally exported `navigate(url)` function; it is an emergent behaviour
+	//    of Polymer components reacting to `yt-navigate` DOM events and then
+	//    updating each other through property bindings. The closest call-sites
+	//    that look useful — things hanging off `window.yt`, module references
+	//    buried in the `yt.config_` object, internal app-component references
+	//    reachable via `document.querySelector('ytd-app')._getYtAppManager()` —
+	//    are all implementation details that change silently with every YouTube
+	//    A/B experiment rollout. Scripts relying on them break every few weeks.
+	//
+	// 2. DISPATCHING `yt-navigate` OURSELVES DOES NOT WORK RELIABLY.
+	//
+	//    `yt-navigate` looks like the right hook — it IS the event YouTube's
+	//    internal Polymer handlers listen to. But:
+	//    a) YouTube ignores or misroutes `yt-navigate` events that were not
+	//       initiated by a trusted user action (a real click). The event's
+	//       `isTrusted` property, the absence of a click ancestor in the event
+	//       path, and various internal "is this a replay of a prior navigation"
+	//       guards all gate whether the handlers fully run.
+	//    b) The endpoint payload format expected by `yt-navigate.detail.endpoint`
+	//       is undocumented, deeply nested, and varies by page type. Getting it
+	//       wrong silently falls back to loading the home page or doing nothing.
+	//    c) Even when it technically works, dispatching the event directly
+	//       skips the throttling and deduplication logic YouTube runs before
+	//       dispatching from a real click, which causes doubled navigations and
+	//       broken history entries when navigating rapidly.
+	//
+	// 3. `history.pushState` ONLY CHANGES THE URL; IT DOES NOT LOAD ANYTHING.
+	//
+	//    YouTube intercepts pushState calls but only for its own internal
+	//    navigations — ones it initiates itself. A userscript calling
+	//    `history.pushState('/watch?v=X', ...)` updates the address bar and
+	//    may trigger a `popstate`, but YouTube's watch-page components do not
+	//    re-initialise in response. The user sees a URL change and nothing else.
+	//
+	// 4. ANCHOR-CLICKING IS THE PATH YOUTUBE TESTS AND MAINTAINS.
+	//
+	//    Every navigation a real user ever performs goes through a
+	//    `yt-simple-endpoint` anchor click. YouTube has to keep that path
+	//    working for their own UI; it is the most exercised and most stable
+	//    code path in the entire frontend. By using it ourselves we inherit
+	//    all of that stability. When YouTube's navigation code changes, it
+	//    changes in a way that still makes their own links work — and ours.
+	//
+	// ── Why mutating `.data` and not just rewriting `href`? ───────────────────
+	//
+	//    `yt-simple-endpoint` anchors carry their navigation target as an
+	//    endpoint object on the element's `.data` property, not in `href`.
+	//    YouTube's Polymer click handler reads `this.data` synchronously on
+	//    click and routes entirely from that; `href` is only a fallback for
+	//    non-JavaScript / non-SPA environments. If you only rewrite `href` and
+	//    leave `.data` pointing at the original video, the router follows `.data`
+	//    and navigates to the original video anyway. Mutating `.data` IS the
+	//    navigation-targeting mechanism, there is no `yt-navigate` event to
+	//    intercept before that read happens.
+	//
+	// ── What happens if `.data` mutation fails? ────────────────────────────────
+	//
+	//    Three defence layers remain active:
+	//      • The rewritten `href` causes a real (non-SPA) page load to the
+	//        right URL, which is slower but correct.
+	//      • The capture-phase `yt-navigate` listener (step 4 below) mutates
+	//        the endpoint if YouTube does dispatch that event, catching code
+	//        paths that ignore `.data` and build the endpoint from somewhere
+	//        else.
+	//      • A warn() is logged so the failure is visible without debug mode.
+	//
+	// ── Strategy summary ──────────────────────────────────────────────────────
+	//
+	// Hijack a YouTube SPA-wired anchor (an `a.yt-simple-endpoint`),
 	// repoint it at our target video, and fake a click. Three layers of hijack
 	// fire from one click; each is a defence in depth for a different YouTube
 	// click-handling code path:
@@ -538,8 +734,8 @@
 	// Why not "the first <a> on the page": that anchor is almost always a
 	// video-card lockup, which is `rel="nofollow"`, NOT carrying the
 	// `yt-simple-endpoint` class, and NOT wired into YouTube's SPA router.
-	// It has no `.data` property to mutate and no `yt-navigate` to intercept
-	//, clicking it is essentially a no-op. Targeting `yt-simple-endpoint`
+	// It has no `.data` property to mutate and no `yt-navigate` to intercept,
+	// clicking it is essentially a no-op. Targeting `yt-simple-endpoint`
 	// gives us the actual SPA-router-wired path.
 
 	const Navigator = {
@@ -832,6 +1028,21 @@
 				clearTimeout(this._unavailableTimer);
 				this._unavailableTimer = null;
 			}
+			// Cancel any pending _waitForVideo timers. Without this, a
+			// fallbackTimer that was scheduled before stop() would still fire
+			// NAV_TIMEOUT_MS later and call _skipUnplayable, which advances the
+			// queue and calls Navigator.goTo on the next entry, even though
+			// _playing is now false. The result is the queue spontaneously
+			// "resuming" with the next video roughly 30s after the user
+			// stopped it.
+			if (this._waitForVideoHandles) {
+				clearInterval(this._waitForVideoHandles.pollTimer);
+				clearTimeout(this._waitForVideoHandles.earlyUnavailableTimer);
+				clearTimeout(this._waitForVideoHandles.fallbackTimer);
+				this._waitForVideoHandles.pollTimer = null;
+				this._waitForVideoHandles.earlyUnavailableTimer = null;
+				this._waitForVideoHandles.fallbackTimer = null;
+			}
 			this._playing = false;
 			this._userPaused = false;
 			this._attachedVideoId = null;
@@ -988,10 +1199,29 @@
 			}
 
 			let resolved = false;
-			const pollTimer = setInterval(() => {
+			// Stash these on the instance so Player.stop() can cancel them.
+			// Before this, a navigation that started, then was stopped by the
+			// user (manual stop, or stop from a different control path) left
+			// the poll + fallback + early-unavailable timers running. NAV_TIMEOUT_MS
+			// later, _skipUnplayable would fire and forcibly advance the queue
+			// even though the queue was no longer "playing", giving the user
+			// the impression the queue had restarted itself.
+			this._waitForVideoHandles = this._waitForVideoHandles || {};
+			const handles = this._waitForVideoHandles;
+			const clearAll = () => {
+				clearInterval(handles.pollTimer);
+				clearTimeout(handles.earlyUnavailableTimer);
+				clearTimeout(handles.fallbackTimer);
+				handles.pollTimer = handles.earlyUnavailableTimer = handles.fallbackTimer = null;
+			};
+			// Make sure we don't leak handles from a prior _waitForVideo call
+			// that overlapped with this one (rapid navigations).
+			clearAll();
+
+			handles.pollTimer = setInterval(() => {
+				if (!this._playing) { clearAll(); return; }
 				if (!tryAttach()) return;
-				clearInterval(pollTimer);
-				clearTimeout(fallbackTimer);
+				clearAll();
 				if (resolved) return;
 				resolved = true;
 				onResolve();
@@ -1002,23 +1232,26 @@
 			// period and then advance rather than stalling for the full
 			// NAV_TIMEOUT_MS. Only triggers when we DO have a next video to fall
 			// through to, otherwise let the long fallback run.
-			const earlyUnavailableTimer = setTimeout(() => {
+			handles.earlyUnavailableTimer = setTimeout(() => {
 				if (resolved) return;
+				if (!this._playing) { clearAll(); return; }
 				if (getVideoId(location.href) !== expectedId) return;
 				if (document.querySelector('video')) return; // <video> exists, just not ready yet
 				if (Storage.queue.length <= 1) return;       // nothing to fall through to
 				resolved = true;
-				clearInterval(pollTimer);
-				clearTimeout(fallbackTimer);
+				clearAll();
 				warn('No <video> element after grace period, assuming unavailable');
 				UI.showStatus('Video unavailable, skipping…', 3000);
 				this._skipUnplayable();
 			}, UNAVAILABLE_CHECK_DELAY_MS);
 
-			const fallbackTimer = setTimeout(() => {
-				clearInterval(pollTimer);
-				clearTimeout(earlyUnavailableTimer);
+			handles.fallbackTimer = setTimeout(() => {
+				clearAll();
 				if (resolved) return;
+				// Queue might have been stopped while we were waiting, don't
+				// resurrect it by skipping to the "next" video. See clearAll()
+				// rationale at top of this block.
+				if (!this._playing) return;
 				resolved = true;
 				warn('Timed out waiting for <video> after', NAV_TIMEOUT_MS, 'ms');
 				// Try to keep going, only stop if there's truly nothing left.
@@ -1036,15 +1269,29 @@
 		 * push the failed video into history (the user never actually watched it).
 		 * Rate-limited via setTimeout so we don't tight-loop through a string of
 		 * dead videos in a single tick.
+		 *
+		 * Aborts if _playing went false between the failed-to-load detection
+		 * and this call (e.g. user pressed stop, or another control path
+		 * cleared the queue). Belt-and-braces, the _waitForVideo timers also
+		 * check _playing before getting here.
 		 */
 		_skipUnplayable() {
+			if (!this._playing) return;
 			Storage.shiftQueue(); // drop the failed entry without writing history
 			this._attachedVideoId = null;
 			this._detachVideoListeners();
+			this._clearEndPoll(); // same rationale as advance(), see comment there
 			UI.refreshPanel();
 			const next = Storage.peekFirst();
 			if (next) {
-				setTimeout(() => Navigator.goTo(next.url), 200);
+				setTimeout(() => {
+					// Re-check, the 200ms delay is a window during which the
+					// user could stop the queue. Without this guard, a manual
+					// stop during the gap would still see a Navigator.goTo
+					// fire and visibly land on the "next" video.
+					if (!this._playing) return;
+					Navigator.goTo(next.url);
+				}, 200);
 			} else {
 				this.stop();
 			}
@@ -1177,6 +1424,16 @@
 			this._attachedVideoId = null;
 			this._navigatingToPrev = false;
 			this._detachVideoListeners();
+			// Also kill any pending end-poll timer from the video we're leaving.
+			// _detachVideoListeners only kills event-listener-driven handlers;
+			// _scheduleEndPoll uses setTimeout and is invisible to the
+			// AbortController. Without this, the OLD video's endpoll can fire
+			// between this call and the new video's _attachVideoListeners
+			// (which would normally clear it via _scheduleEndPoll → _clearEndPoll),
+			// and `video.ended` is still true on the reused <video> element, so
+			// the orphan timer calls advance() AGAIN — silently skipping the
+			// next entry in the queue without it ever being played.
+			this._clearEndPoll();
 			UI.refreshPanel();
 			if (next) Navigator.goTo(next.url);
 			else this.stop();
@@ -1491,6 +1748,47 @@
 	// ── PhonePoller ───────────────────────────────────────────────────────────
 	// Polls the local server for videos shared from the phone and enqueues them.
 
+	/**
+	 * Fetch a video title via YouTube's public oEmbed endpoint.
+	 *
+	 * Used as a fallback when the share payload from the phone arrives without
+	 * a title (e.g. a bare-URL share). Returns the title string on success,
+	 * null on any failure (network, non-2xx, parse, timeout).
+	 *
+	 * Why oEmbed and not something heavier:
+	 *   - No API key, no quota, no auth.
+	 *   - Tiny JSON response (~200 bytes).
+	 *   - Official endpoint, less fragile than scraping a watch page for
+	 *     <title> / og:title.
+	 *
+	 * Same-origin caveat:
+	 *   YouTube's oEmbed endpoint does NOT send Access-Control-Allow-Origin,
+	 *   so a cross-origin fetch from the page is blocked. We rely on the
+	 *   userscript running INSIDE www.youtube.com (same scheme + host + port
+	 *   as oembed), which makes this a same-origin request that bypasses CORS
+	 *   entirely. That holds for desktop YouTube. From m.youtube.com or
+	 *   music.youtube.com the request is cross-origin and will fail, the
+	 *   caller falls back to the default placeholder title in that case.
+	 *   Keeping @grant none also keeps us in page context, which the rest
+	 *   of the script (Firefox Xray shims, .data anchor mutation) depends on,
+	 *   so swapping in GM.xmlHttpRequest is not an option.
+	 *
+	 *   Unlisted, age-gated, and private videos return 401 from oEmbed. Same
+	 *   fallback path applies.
+	 */
+	async function fetchYouTubeTitle(url) {
+		try {
+			const oembed = 'https://www.youtube.com/oembed?url=' +
+				encodeURIComponent(url) + '&format=json';
+			const res = await fetch(oembed, { signal: AbortSignal.timeout(3000) });
+			if (!res.ok) return null;
+			const data = await res.json();
+			return (data && typeof data.title === 'string' && data.title.trim()) || null;
+		} catch {
+			return null;
+		}
+	}
+
 	const PhonePoller = {
 		_timer: null,
 
@@ -1551,7 +1849,20 @@
 					return;
 				}
 				const url = watchUrl(videoId);
-				const title = (data.title && data.title.trim()) ? data.title.trim() : 'Shared from phone';
+				// Title resolution order:
+				//   1. The title from the phone share payload (preferred,
+				//      it's the one the user actually sees on the source page).
+				//   2. YouTube's oEmbed endpoint, when (1) is missing.
+				//   3. A literal placeholder, when both fail (offline, CORS
+				//      block on m.youtube.com, private/age-gated video, etc).
+				let title = (data.title && data.title.trim()) ? data.title.trim() : '';
+				if (!title) {
+					log('PhonePoller: no title in payload, fetching via oEmbed');
+					title = await fetchYouTubeTitle(url);
+					if (title) log('PhonePoller: oEmbed title:', title);
+					else log('PhonePoller: oEmbed fetch failed or returned nothing');
+				}
+				if (!title) title = 'Shared from phone';
 				const added = Storage.addVideo(url, title, '');
 				if (added) {
 					UI.updateControls();
@@ -1578,6 +1889,7 @@
 
 		start() {
 			this._injectStyles();
+			this._createOverlay();
 			this._injectAll();
 			setTimeout(() => this._injectAll(), 800);
 			setTimeout(() => this._injectAll(), 2000);
@@ -1671,6 +1983,34 @@
 					z-index: 2147483647;
 					border: 1px solid rgba(255,255,255,0.15);
 				}
+				/* Singleton body-level overlay button. Sits ON TOP of whichever
+				   card's button is currently hovered, escaping every YouTube
+				   stacking context (because it's at the body level, not inside
+				   any ytd-* element). Forwards clicks to the underlying card
+				   button so all queue/state logic stays with the existing
+				   per-card buttons — this overlay is just a click-target proxy
+				   that's always reachable. Width/height match the card buttons
+				   exactly so they overlap pixel-for-pixel. */
+				.ytqm-thumb-overlay-btn {
+					position: fixed !important;
+					/* top/left set dynamically per hover */
+					/* z-index is one above the body tooltip's 2147483647 would
+					   normally clash, so we lower the overlay tooltip in JS by
+					   appending it AFTER the overlay button in the body, which
+					   wins same-z-index tie. Actual z-index here is max int. */
+					z-index: 2147483647 !important;
+					pointer-events: auto;
+				}
+				/* When the overlay is showing, hide the per-card button under
+				   it. Without this, both buttons render at (approximately) the
+				   same spot — and subtle differences in box-shadow rendering,
+				   anti-aliasing, or sub-pixel positioning make the doubling
+				   visible. The overlay IS the UI now; the card button still
+				   exists as the canonical state holder and click target, but
+				   never needs to be visible while the overlay can stand in. */
+				html.ytqm-overlay-active .ytqm-thumb-add-btn:not(.ytqm-thumb-overlay-btn) {
+					opacity: 0 !important;
+				}
 			`;
 			this._styleEl = document.createElement('style');
 			this._styleEl.id = 'ytqm-thumb-styles';
@@ -1735,7 +2075,18 @@
 			// subsequent ones short-circuit here. _injectButton has its own
 			// deep-search guard as a belt-and-braces backup.
 			if (card.querySelector('.ytqm-thumb-add-btn')) return;
-			this._injectButton(anchor, card, card);
+			// Mount the button on the thumbnail ANCHOR, not on card (the outer
+			// Polymer element). Both are correct for visual placement since the
+			// anchor IS the thumbnail container, but the anchor is a plain <a>
+			// tag whereas the outer card (ytd-video-renderer, yt-lockup-view-model
+			// etc.) is a Polymer custom element whose shady-DOM rendering can
+			// swallow appended children — making them disappear from layout and
+			// return a 0×0 getBoundingClientRect, which in turn breaks the
+			// overlay positioning. The anchor is reliable across all layouts.
+			// card is still passed as the _cards map key and hover-tracking
+			// key so the rest of the system (overlay, syncAllButtons, hover
+			// handlers) is unchanged.
+			this._injectButton(anchor, anchor, card);
 		},
 
 		// End-of-video suggestion wall tiles. Anchor serves as both container
@@ -1972,6 +2323,204 @@
 			};
 		},
 
+		// ── Body-level overlay button ────────────────────────────────────────────
+		//
+		// Some YouTube layouts (notably search results) wrap each card in a
+		// stacking context that ranks below the inline-preview overlay
+		// (ytd-video-preview). Once a per-card button is trapped inside such
+		// a context, no z-index value can lift it above vpNode — z-index only
+		// orders elements WITHIN the same stacking context. The fix is to put
+		// a button at the body level (escaping every ytd-* context) and have
+		// it sit on top of whichever card-button the user is hovering.
+		//
+		// This overlay does NOT have its own state machine, click logic, or
+		// metadata extraction. It is a pure proxy: clicks/contextmenus are
+		// forwarded to the underlying card-button, which already has all that
+		// machinery. State is mirrored from the card-button each time the
+		// overlay is shown, and re-mirrored from _applyState whenever the
+		// hovered card's state changes.
+		_createOverlay() {
+			if (this._overlayBtn) return;
+
+			const btn = document.createElement('button');
+			btn.className = 'ytqm-thumb-add-btn ytqm-thumb-overlay-btn ytqm-state-idle';
+			btn._ytqmState = 'idle';
+			const span = document.createElement('span');
+			span.innerHTML = `<svg viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg" style="width:18px;height:18px;display:block"><path d="M9 2V16M2 9H16" stroke="white" stroke-width="2.2" stroke-linecap="round"/></svg>`;
+			btn.appendChild(span);
+
+			const tooltip = document.createElement('div');
+			tooltip.className = 'ytqm-thumb-tooltip';
+			tooltip.textContent = 'Add to Queue';
+
+			btn.addEventListener('mouseenter', () => {
+				const r = btn.getBoundingClientRect();
+				tooltip.style.left = (r.left + r.width / 2) + 'px';
+				tooltip.style.top = (r.top - 8) + 'px';
+				tooltip.style.transform = 'translate(-50%, -100%)';
+				tooltip.style.opacity = '1';
+			});
+			btn.addEventListener('mouseleave', () => {
+				tooltip.style.opacity = '0';
+			});
+
+			// Forward clicks to the currently-hovered card's button. We use
+			// .click() rather than dispatchEvent so the synthetic event flows
+			// through the same path as a user click (and the card-button's
+			// preventDefault/stopPropagation work as expected). If for some
+			// reason the card button is gone (DOM was rebuilt mid-hover), we
+			// just no-op rather than throwing.
+			btn.addEventListener('click', e => {
+				e.preventDefault();
+				e.stopPropagation();
+				const card = this._currentHoverCard;
+				if (!card) return;
+				const entry = this._cards.get(card);
+				if (!entry?.btn) return;
+				entry.btn.click();
+			});
+
+			btn.addEventListener('contextmenu', e => {
+				e.preventDefault();
+				e.stopPropagation();
+				const card = this._currentHoverCard;
+				if (!card) return;
+				const entry = this._cards.get(card);
+				if (!entry?.btn) return;
+				// dispatchEvent because HTMLElement has no .contextmenu().
+				// bubbles+cancelable matches a real user contextmenu event.
+				entry.btn.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+			});
+
+			document.body.appendChild(btn);
+			document.body.appendChild(tooltip);
+			this._overlayBtn = btn;
+			this._overlayTooltip = tooltip;
+			this._currentHoverCard = null;
+
+			// Move overlay into vpNode's stacking context. document.body is the
+			// initial mount target so the button exists in the DOM immediately,
+			// but on layouts like search results some ancestor of vpNode has a
+			// containing-block-establishing property (transform, will-change,
+			// filter, contain, etc.) which traps body-level fixed-positioned
+			// elements in body's stacking context, not the viewport's — and
+			// vpNode then renders above us because it's in the trapping
+			// ancestor's context. By reparenting into vpNode's grandparent
+			// (#video-preview, which is a sibling of the loader that wraps
+			// vpNode itself), we land in vpNode's own stacking context and a
+			// high z-index reliably wins.
+			//
+			// #video-preview may not exist yet at script start. We try a few
+			// fallbacks in decreasing order of confidence and re-try on the
+			// next mutation if all of them miss.
+			const reparent = () => {
+				const target = document.getElementById('video-preview')
+					|| document.querySelector('ytd-app')
+					|| document.body;
+				if (target !== this._overlayBtn.parentElement) {
+					target.appendChild(this._overlayBtn);
+					target.appendChild(this._overlayTooltip);
+					this._overlayHost = target;
+				}
+			};
+			reparent();
+			// Watch for #video-preview being inserted later. We only need this
+			// to fire ONCE per page navigation: once #video-preview exists,
+			// reparent picks it up and we disconnect.
+			if (this._overlayHost?.id !== 'video-preview') {
+				const mo = new MutationObserver(() => {
+					if (document.getElementById('video-preview')) {
+						reparent();
+						mo.disconnect();
+					}
+				});
+				mo.observe(document.body, { childList: true, subtree: true });
+			}
+
+			// Hide on scroll. The fixed-positioned overlay would otherwise
+			// stay in place while the underlying card scrolls away, leaving
+			// it floating over unrelated content. Scrolling usually also
+			// triggers mouseleave naturally, but not always (e.g. wheel scroll
+			// without cursor movement), so handle it explicitly.
+			window.addEventListener('scroll', () => this._hideOverlay(), true);
+			window.addEventListener('resize', () => this._hideOverlay());
+		},
+
+		_showOverlayOver(card, entry) {
+			if (!this._overlayBtn) return;
+			this._currentHoverCard = card;
+			const cardBtn = entry.btn;
+			// Use the card-button's actual viewport rect. It's the canonical
+			// position we want to overlay. The card-button is normally hidden
+			// (opacity 0) when its card isn't hovered, but it still has a
+			// non-zero bounding rect because opacity doesn't affect layout.
+			const r = cardBtn.getBoundingClientRect();
+			if (r.width > 0 && r.height > 0) {
+				// Probe-based offset. position:fixed positions relative to the
+				// viewport WHEN there's no transformed ancestor, but relative
+				// to the nearest containing-block-establishing ancestor when
+				// there IS one. Since we've reparented the overlay into vpNode's
+				// stacking context to fix the z-index issue, its containing
+				// block may now be that ancestor rather than the viewport. By
+				// setting 0,0 and reading back the actual viewport position,
+				// we measure the containing-block offset, then subtract.
+				this._overlayBtn.style.left = '0px';
+				this._overlayBtn.style.top = '0px';
+				const probe = this._overlayBtn.getBoundingClientRect();
+				this._overlayBtn.style.left = (r.left - probe.left) + 'px';
+				this._overlayBtn.style.top = (r.top - probe.top) + 'px';
+				this._overlayBtn.style.width = r.width + 'px';
+				this._overlayBtn.style.height = r.height + 'px';
+			} else {
+				// Fallback: position at the card's top-left + 8px padding to
+				// match the card-button's normal absolute offset. Used when
+				// the card-button has 0×0 rect for any reason (display:none
+				// on an ancestor, etc).
+				const cr = card.getBoundingClientRect();
+				this._overlayBtn.style.left = '0px';
+				this._overlayBtn.style.top = '0px';
+				const probe = this._overlayBtn.getBoundingClientRect();
+				this._overlayBtn.style.left = (cr.left + 8 - probe.left) + 'px';
+				this._overlayBtn.style.top = (cr.top + 8 - probe.top) + 'px';
+				this._overlayBtn.style.width = '';
+				this._overlayBtn.style.height = '';
+			}
+			this._mirrorOverlayFrom(cardBtn, entry.tooltip);
+			this._overlayBtn.classList.add('ytqm-visible');
+			// Mark the overlay as active globally so the per-card button
+			// underneath this overlay (and any other card buttons that happen
+			// to also be in a visible state, like a just-added ytqm-active
+			// flash) get hidden via the html.ytqm-overlay-active CSS rule.
+			// See _injectStyles for the full rationale.
+			document.documentElement.classList.add('ytqm-overlay-active');
+		},
+
+		_hideOverlay() {
+			if (!this._overlayBtn) return;
+			this._currentHoverCard = null;
+			this._overlayBtn.classList.remove('ytqm-visible');
+			if (this._overlayTooltip) this._overlayTooltip.style.opacity = '0';
+			document.documentElement.classList.remove('ytqm-overlay-active');
+		},
+
+		// Copy the card-button's visual state onto the overlay. Called from
+		// _showOverlayOver and from _applyState when the hovered card's
+		// state changes (so e.g. "Added!" feedback is visible on the overlay).
+		_mirrorOverlayFrom(cardBtn, cardTooltip) {
+			if (!this._overlayBtn) return;
+			const state = cardBtn._ytqmState || 'idle';
+			this._overlayBtn._ytqmState = state;
+			this._overlayBtn.classList.remove('ytqm-state-idle', 'ytqm-state-added', 'ytqm-state-dupe', 'ytqm-state-removed', 'ytqm-state-next');
+			this._overlayBtn.classList.add(`ytqm-state-${state}`);
+			this._overlayBtn.classList.toggle('ytqm-active', cardBtn.classList.contains('ytqm-active'));
+			const cardSpan = cardBtn.querySelector('span');
+			const overlaySpan = this._overlayBtn.querySelector('span');
+			if (cardSpan && overlaySpan) overlaySpan.innerHTML = cardSpan.innerHTML;
+			if (cardTooltip && this._overlayTooltip) {
+				this._overlayTooltip.textContent = cardTooltip.textContent;
+			}
+		},
+
 		/**
 		 * Drive the visual state of a thumbnail button.
 		 *
@@ -2020,6 +2569,14 @@
 			tooltip.textContent = cfg.tooltip;
 
 			if (resetAfterMs !== null) btn._ytqmResetTimer = setTimeout(() => this._applyState(entry, 'idle'), resetAfterMs);
+
+			// If this entry's card is the one currently being hovered, also
+			// update the overlay button so the user sees immediate feedback
+			// (e.g. "Added!" on click). Reverse-lookup is via the singleton
+			// _currentHoverCard so we don't have to thread the card down here.
+			if (this._currentHoverCard && this._cards.get(this._currentHoverCard) === entry) {
+				this._mirrorOverlayFrom(btn, entry.tooltip);
+			}
 		},
 
 		_startHoverTracking() {
@@ -2064,21 +2621,57 @@
 			};
 
 			document.addEventListener('mouseenter', e => {
+				// If cursor enters vpNode while a hide timer is pending for the
+				// currently tracked card, cancel it immediately. vpNode only
+				// appears because the user is hovering a card, so entering it
+				// never means "left the card". This handles the gap scenario:
+				// on edge/first-column cards vpNode can be offset slightly so
+				// the cursor briefly isn't over the card OR vpNode, starting
+				// the hide timer before the cursor reaches vpNode.
+				if (e.target.closest?.(SEL.VIDEO_PREVIEW) && this._currentHoverCard) {
+					const entry = this._cards.get(this._currentHoverCard);
+					if (entry?.hideTimer) {
+						clearTimeout(entry.hideTimer);
+						entry.hideTimer = null;
+					}
+					// Don't fall through — the URL match in findEntry might
+					// fail if vpNode's href isn't loaded yet, which would
+					// cause _showOverlayOver to not run. The overlay is
+					// already showing from the card hover, so just leaving it
+					// alone is the right call here.
+					return;
+				}
 				const hit = findEntry(e.target);
 				if (!hit) return;
 				clearTimeout(hit.entry.hideTimer);
 				hit.entry.hideTimer = null;
 				hit.entry.btn.classList.add('ytqm-visible');
+				// Also position+show the body-level overlay button on top
+				// of the card-button, so we have a click target that
+				// escapes any stacking context vpNode might cover us with.
+				this._showOverlayOver(hit.card, hit.entry);
 			}, true);
 
 			document.addEventListener('mouseleave', e => {
 				const hit = findEntry(e.target);
 				if (!hit) return;
 				const rel = e.relatedTarget;
-				// Don't hide if the cursor moved to something that resolves to
-				// the same card (e.g. cursor moved from card metadata onto vpNode
-				// overlaying the same thumbnail, or vice-versa).
 				if (rel) {
+					// Treat the overlay button (and its tooltip) as part of
+					// the current card, otherwise moving the cursor onto the
+					// overlay would fire mouseleave on the card and start the
+					// hide timer.
+					if (rel === this._overlayBtn || rel === this._overlayTooltip ||
+						rel.closest?.('.ytqm-thumb-overlay-btn')) return;
+					// If cursor moved directly onto vpNode, never hide. vpNode
+					// only appears when the user is hovering a card, so it is
+					// always "same card" semantically. We check this explicitly
+					// before the URL-match fallback because vpNode's href is
+					// often not yet loaded when this event fires (it loads
+					// asynchronously after hover), which makes findEntry return
+					// null for vpNode and causes a spurious hide — visible as
+					// the button flashing briefly then disappearing.
+					if (rel.closest?.(SEL.VIDEO_PREVIEW)) return;
 					const relHit = findEntry(rel);
 					if (relHit && relHit.card === hit.card) return;
 				}
@@ -2087,6 +2680,10 @@
 					hit.entry.btn.classList.remove('ytqm-visible');
 					hit.entry.tooltip.style.opacity = '0';
 					hit.entry.hideTimer = null;
+					// Only hide the overlay if it's still showing for THIS
+					// card. Hovering a different card in the meantime would
+					// have already updated _currentHoverCard.
+					if (this._currentHoverCard === hit.card) this._hideOverlay();
 				}, THUMBNAIL_HIDE_DELAY_MS);
 			}, true);
 		},
@@ -2520,6 +3117,11 @@
 					sub: 'Suppress the native Watch Later and Add to Queue buttons that appear on hover, so only the queue manager button is shown.'
 				},
 				{
+					key: 'hideShorts',
+					label: 'Hide Shorts',
+					sub: 'Hide YouTube Shorts from search results, home feed, subscriptions, shelves, and the Shorts button in the side navigation.'
+				},
+				{
 					key: 'enqueueFromPhone',
 					label: 'Enqueue videos shared from phone',
 					sub: 'Videos shared from your Android device via the local server go straight into the queue instead of opening a new tab.'
@@ -2590,6 +3192,7 @@
 						if (def.key === 'theaterMode') TheaterMode.init();
 						if (def.key === 'mediaSessionRefresh' && Player._playing) Player._registerMediaSession();
 						if (def.key === 'hideNativeButtons') NativeButtonHider.apply();
+						if (def.key === 'hideShorts') ShortsHider.apply();
 						if (def.key === 'enqueueFromPhone') {
 							input.checked ? PhonePoller.start() : PhonePoller.stop();
 						}
@@ -3156,6 +3759,52 @@
 		},
 	};
 
+	const ShortsHider = {
+		_styleEl: null,
+		// Selectors cover every surface where Shorts appear:
+		//   - Mini-guide nav button (the collapsed sidebar icon)
+		//   - Full sidebar guide entry
+		//   - Search results (ytd-video-renderer with /shorts/ anchor)
+		//   - Home / subscriptions grid cards (ytd-rich-item-renderer)
+		//   - Shorts shelves and their section wrappers on the home feed
+		//   - Compact list cards (ytd-compact-video-renderer)
+		//   - Any yt-lockup-view-model (new layout catch-all) linking to /shorts/
+		//
+		// Identification: Shorts always link to /shorts/… rather than
+		// /watch?v=…, so a[href^="/shorts"] is the reliable discriminator.
+		// ytd-reel-shelf-renderer is the dedicated shelf YouTube injects for
+		// Shorts sections and doesn't need an href check.
+		_CSS: [
+			// Navigation
+			`ytd-mini-guide-entry-renderer:has(a[href^="/shorts"]){display:none!important}`,
+			`ytd-guide-entry-renderer:has(a[href^="/shorts"]){display:none!important}`,
+			// Cards
+			`ytd-video-renderer:has(a[href^="/shorts"]){display:none!important}`,
+			`ytd-rich-item-renderer:has(a[href^="/shorts"]){display:none!important}`,
+			`ytd-compact-video-renderer:has(a[href^="/shorts"]){display:none!important}`,
+			`yt-lockup-view-model:has(a[href^="/shorts"]){display:none!important}`,
+			// Shelves and shelf wrappers
+			`ytd-reel-shelf-renderer{display:none!important}`,
+			`ytd-rich-section-renderer:has(ytd-reel-shelf-renderer){display:none!important}`,
+			// Search-page Shorts grid shelf (grid-shelf-view-model with ytm-shorts-lockup items)
+			`grid-shelf-view-model:has(a[href^="/shorts"]){display:none!important}`,
+		].join(''),
+		apply() {
+			const shouldHide = Settings.get().hideShorts;
+			if (shouldHide && !this._styleEl) {
+				this._styleEl = document.createElement('style');
+				this._styleEl.id = 'ytqm-hide-shorts';
+				this._styleEl.textContent = this._CSS;
+				document.head.appendChild(this._styleEl);
+				log('ShortsHider: hidden');
+			} else if (!shouldHide && this._styleEl) {
+				this._styleEl.remove();
+				this._styleEl = null;
+				log('ShortsHider: restored');
+			}
+		},
+	};
+
 	// ── URL Change Detection ──────────────────────────────────────────────────
 
 	let lastUrl = location.href;
@@ -3167,6 +3816,19 @@
 
 	function onUrlChange() {
 		log('URL changed to', location.href);
+		// If the user navigated away from a watch page while the queue was
+		// playing (clicked the YouTube logo, opened the subscriptions feed,
+		// went to a channel, etc.), treat that as an implicit "I'm done with
+		// the queue" and stop. Without this, _playing stays true with no
+		// <video> to attach to, the stop button is the only way out, and any
+		// subsequent yt-navigate-finish will try to re-attach which is
+		// surprising. Queue advancement is safe because every advance goes
+		// directly /watch?v=X → /watch?v=Y, never via an intermediate
+		// non-watch URL (verified from the navigation logs).
+		if (Player._playing && !Page.isWatchPage()) {
+			log('Navigated off watch page while queue was playing, stopping');
+			Player.stop();
+		}
 		UI.updateControls();
 		if (UI.panelOpen) UI.refreshPanel();
 		if (Page.isWatchPage()) TheaterMode.init();
@@ -3355,17 +4017,51 @@
 		ThumbnailInjector.start();
 		ContextMenuBlocker.init();
 		NativeButtonHider.apply();
+		ShortsHider.apply();
 		KeyboardShortcuts.init();
 		if (Page.isWatchPage()) TheaterMode.init();
 		if (Settings.get().enqueueFromPhone) PhonePoller.start();
 
-		// Recover playback state after a page refresh. If the playing flag was
-		// persisted but Player._playing is false (it's always false on boot),
-		// a refresh happened mid-queue, resume from where we left off.
+		// Recover playback state after a page refresh.
+		//
+		// Conditions for auto-resume:
+		//   - Storage.playing flag is set (some tab was playing)
+		//   - There's something to resume to
+		//   - The boot URL matches the queue head video ID
+		//
+		// The last condition is what disambiguates "user refreshed mid-queue
+		// on the queue-head watch page" (the case we want to handle) from
+		// false positives that previously triggered an unwanted auto-jump:
+		//   1. Opening a new tab while another tab is playing the queue:
+		//      Storage.playing is true, but this new tab is on the homepage,
+		//      not the queue head. Without the URL check the new tab would
+		//      steal playback ownership and forcibly navigate itself to the
+		//      queue head.
+		//   2. Browser crash / forced kill of the playing tab: beforeunload
+		//      didn't fire, so Storage.playing stays true indefinitely. Any
+		//      later tab open would trigger an unwanted resume. With the URL
+		//      check, the flag is just inert until the user does something
+		//      that overwrites it (Play or Stop).
+		//   3. User manually navigated to a different watch page while the
+		//      queue was playing, then refreshed: the URL is no longer the
+		//      queue head, so we don't fight the user's nav choice.
+		//
+		// We deliberately do NOT clear Storage.playing in the don't-resume
+		// case. Another tab may legitimately be playing right now, and
+		// clearing the flag would break its own future refresh-recovery.
+		// The flag is self-healing, the next Player.start or Player.stop
+		// from any tab will overwrite it.
 		const _bootState = Storage.load();
 		if (_bootState.playing && _bootState.queue.length > 0) {
-			log('Resuming queue after page refresh, queue has', _bootState.queue.length, 'items.');
-			Player.start();
+			const currentId = getVideoId(location.href);
+			const queueHeadId = getVideoId(_bootState.queue[0].url);
+			if (currentId && currentId === queueHeadId) {
+				log('Resuming queue after page refresh, queue has', _bootState.queue.length, 'items.');
+				Player.start();
+			} else {
+				log('Persisted playing flag but boot URL does not match queue head, not auto-resuming. ' +
+					'(boot URL id:', currentId, ', queue head id:', queueHeadId, ')');
+			}
 		}
 
 		log('Ready. Queue has', Storage.queue.length, 'items.');
