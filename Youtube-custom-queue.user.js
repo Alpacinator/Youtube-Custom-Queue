@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name YouTube Queue Manager
 // @namespace https://github.com/Alpacinator/Youtube-Custom-Queue/
-// @version 2.2.0
+// @version 2.3.0
 // @description A persistent, cross-tab YouTube queue manager with drag-to-reorder, auto-advance, and optional auto theater mode.
 // @match *://*.youtube.com/*
 // @grant none
@@ -11,6 +11,38 @@
 /**
  * ─────────────────────────────────────────────────────────────────────────────
  * CHANGELOG
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * 2.3.0 (vs 2.2.0)
+ * -----------------
+ *
+ * CROSS-TAB CONTROLS
+ *
+ *   The Prev / Pause / Skip buttons inside the queue panel already existed
+ *   as of 2.2.0 and worked correctly. What was missing was any indication
+ *   on the button bar itself that another tab was playing, making it unclear
+ *   whether the queue was active at all when you switched tabs.
+ *
+ *   Play button — remote state
+ *     The main Play Queue button now has three visual states:
+ *       • ▶ Play Queue (n)         — nothing playing anywhere, default dark.
+ *       • ■ Stop Queue             — this tab is playing, red (unchanged).
+ *       • ■ Stop Queue (other tab) — another tab owns playback, blue.
+ *     The blue state appears as soon as the playing tab's heartbeat is
+ *     detected and disappears within one HEARTBEAT_TTL_MS window (10 s)
+ *     after the other tab stops. updateControls() now also fires on
+ *     heartbeat/PLAYING_KEY storage events so the transition is prompt.
+ *
+ *   Remote stop signal
+ *     Clicking the blue "Stop Queue (other tab)" button writes a timestamp
+ *     to yt_queue_stop_signal in localStorage (same pattern as the existing
+ *     skip signal). The playing tab's storage listener picks it up, pauses
+ *     the video first, waits 300 ms for the browser to render the paused
+ *     frame, then calls Player.stop(). Pausing first gives the user on the
+ *     playing tab a visible cue that something happened before the queue UI
+ *     tears down. If the video is already paused or ended, stop() is called
+ *     immediately with no delay.
+ *
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * 2.2.0 (vs 2.1.8)
@@ -177,12 +209,13 @@
 	// metadata at the top of this file; both must be bumped together. The
 	// public API exposes this as window.ytQueueManager.version, and the boot
 	// banner prints it so users can verify which build is actually running.
-	const VERSION = '2.2.0';
+	const VERSION = '2.3.0';
 
 	const STORAGE_KEY = 'yt_queue_manager_v1';
 	const PLAYING_KEY = 'yt_queue_playing_tab';
 	const HEARTBEAT_KEY = 'yt_queue_heartbeat';
 	const SKIP_KEY = 'yt_queue_skip_signal';
+	const STOP_KEY = 'yt_queue_stop_signal';
 	const SETTINGS_KEY = 'yt_queue_settings_v1';
 	const DEBUG_KEY = 'ytqm_debug'; // localStorage flag, set to '1' to enable verbose logging
 	const HEARTBEAT_INTERVAL_MS = 3000;
@@ -564,8 +597,12 @@
 			Player._onPauseStorageChange();
 			ThumbnailInjector.syncAllButtons();
 		}
-		if (e.key === PLAYING_KEY || e.key === HEARTBEAT_KEY) UI.updateRemotePauseBtn();
+		if (e.key === PLAYING_KEY || e.key === HEARTBEAT_KEY) {
+			UI.updateControls();
+			UI.updateRemotePauseBtn();
+		}
 		if (e.key === SKIP_KEY && e.newValue !== null) Player._onRemoteSkip();
+		if (e.key === STOP_KEY && e.newValue !== null) Player._onRemoteStop();
 	});
 
 	// ── PlayingTab ────────────────────────────────────────────────────────────
@@ -1084,6 +1121,23 @@
 			log('Remote skip received');
 			localStorage.removeItem(SKIP_KEY);
 			this.skip();
+		},
+
+		_onRemoteStop() {
+			if (!this._playing) return;
+			log('Remote stop received, pausing before stop');
+			localStorage.removeItem(STOP_KEY);
+			// Pause the video visibly first so the user on this tab sees
+			// playback halt before the UI tears down. The 300ms gives the
+			// browser one frame to render the paused state before stop()
+			// removes the player listeners and clears the queue controls.
+			const video = document.querySelector('video');
+			if (video && !video.paused && !video.ended) {
+				video.pause();
+				setTimeout(() => this.stop(), 300);
+			} else {
+				this.stop();
+			}
 		},
 
 		_onPauseStorageChange() {
@@ -2765,6 +2819,7 @@
         #ytqm-add-btn, #ytqm-queue-toggle, #ytqm-play-btn { background: rgba(20,20,20,0.85); color: #fff; }
         #ytqm-add-btn { position: relative; }
         #ytqm-play-btn.is-playing { background: #c0392b; }
+        #ytqm-play-btn.is-remote  { background: #1a6fa8; border-color: rgba(100,180,255,0.7); }
         #ytqm-root .ytqm-btn { flex: 1; }
       `;
 		},
@@ -3402,6 +3457,11 @@
 		_onPlayClick() {
 			if (Player._playing) {
 				Player.stop();
+			} else if (PlayingTab.anyPlaying()) {
+				// Another tab owns the queue. Signal it to stop rather than
+				// trying to start a new queue here. The playing tab receives
+				// the localStorage event and calls Player.stop() on itself.
+				localStorage.setItem(STOP_KEY, Date.now().toString());
 			} else {
 				if (Storage.queue.length === 0) {
 					this.flashBtn(this.playBtn, 'Queue is empty');
@@ -3519,6 +3579,7 @@
 			if (!this.addBtn) return;
 			const isWatch = Page.isWatchPage();
 			const playing = Player._playing;
+			const remoteOnly = !playing && PlayingTab.anyPlaying();
 			const count = Storage.queue.length;
 			this.queueToggleBtn.textContent = count > 0 ? `\u2261 Queue (${count})` : '\u2261 Queue';
 			const currentUrl = isWatch ? `https://www.youtube.com/watch?v=${new URLSearchParams(location.search).get('v')}` : null;
@@ -3526,8 +3587,25 @@
 			this.addBtn.style.display = isWatch ? 'inline-flex' : 'none';
 			if (isWatch) this.addBtnLabel.textContent = alreadyQueued ? '\u2212 Remove from Queue' : '\uff0b Add to Queue';
 			this.playBtn.style.display = 'inline-flex';
-			this.playBtn.textContent = playing ? '\u25a0 Stop Queue' : (count > 0 ? `\u25b6 Play Queue (${count})` : '\u25b6 Play Queue');
-			playing ? this.playBtn.classList.add('is-playing') : this.playBtn.classList.remove('is-playing');
+			if (playing) {
+				// This tab owns playback.
+				this.playBtn.textContent = '\u25a0 Stop Queue';
+				this.playBtn.classList.add('is-playing');
+				this.playBtn.classList.remove('is-remote');
+				this.playBtn.title = 'Stop the queue in this tab';
+			} else if (remoteOnly) {
+				// Another tab is playing. Blue to distinguish from the local red
+				// "stop" state, label makes it explicit which tab the action affects.
+				this.playBtn.textContent = '\u25a0 Stop Queue (other tab)';
+				this.playBtn.classList.remove('is-playing');
+				this.playBtn.classList.add('is-remote');
+				this.playBtn.title = 'Signal the playing tab to stop the queue';
+			} else {
+				// Nothing playing anywhere.
+				this.playBtn.textContent = count > 0 ? `\u25b6 Play Queue (${count})` : '\u25b6 Play Queue';
+				this.playBtn.classList.remove('is-playing', 'is-remote');
+				this.playBtn.title = '';
+			}
 			this.updateRemotePauseBtn();
 		},
 
