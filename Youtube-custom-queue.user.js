@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name YouTube Queue Manager
 // @namespace https://github.com/Alpacinator/Youtube-Custom-Queue/
-// @version 2.3.2
+// @version 2.4.0
 // @description A persistent, cross-tab YouTube queue manager with drag-to-reorder, auto-advance, and optional auto theater mode.
 // @match *://*.youtube.com/*
 // @grant none
@@ -12,6 +12,40 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * CHANGELOG
  * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * 2.4.0 (vs 2.3.2)
+ * -----------------
+ *
+ * NEW FEATURES
+ *
+ *   Settings reorganisation with category headers
+ *     The settings modal is now divided into four labelled sections:
+ *     Appearance, YouTube, Phone, and Playback. Items are reordered so
+ *     related controls sit together. Cross-tab controls, Auto theater
+ *     mode, and Always restart from beginning are now grouped under
+ *     Playback.
+ *
+ *   Frosted glass queue panel  (settings toggle, default ON)
+ *     A new Appearance toggle applies backdrop-filter blur and a
+ *     semi-transparent background to the queue panel, giving it a
+ *     frosted glass look. Toggling it off restores the solid dark
+ *     background.
+ *
+ *   Phone Server URL shown only when Enqueue from phone is on
+ *     The Phone server URL input now lives directly below the Enqueue
+ *     from phone toggle and is hidden whenever that toggle is off.
+ *     It reappears immediately when the toggle is turned on, keeping
+ *     the settings list uncluttered.
+ *
+ * UI CHANGES
+ *
+ *   Panel header: title text removed, cog icon enlarged and whitened
+ *     The word Queue has been removed from the panel header title
+ *     area. The settings cog is the sole interactive element there.
+ *     The icon is enlarged from 13 px to 20 px and rendered in solid
+ *     white for better visibility against the panel background.
+ *
+ * -----------------------------------------------------------------------------
  *
  * 2.3.2 (vs 2.3.1)
  * -----------------
@@ -259,7 +293,7 @@
 	// metadata at the top of this file; both must be bumped together. The
 	// public API exposes this as window.ytQueueManager.version, and the boot
 	// banner prints it so users can verify which build is actually running.
-	const VERSION = '2.3.2';
+	const VERSION = '2.4.0';
 
 	const STORAGE_KEY = 'yt_queue_manager_v1';
 	const PLAYING_KEY = 'yt_queue_playing_tab';
@@ -293,6 +327,7 @@
 	const REMOTE_STOP_PAUSE_DELAY_MS = 300; // let the paused frame render before teardown
 	const SKIP_UNPLAYABLE_DELAY_MS = 200;   // rate-limit advancing through dead videos
 	const OVERLAY_REPARENT_WATCH_MS = 15000; // stop watching for #video-preview after this long
+	const PANEL_AUTOCLOSE_DELAY_MS = 3000; // panel auto-closes this long after the cursor leaves it
 
 	// Thumbnail button colours, referenced from a single <style> sheet now,
 	// not inline. Kept here as the source of truth so they stay in sync if
@@ -314,6 +349,7 @@
 		phoneServerUrl: 'http://localhost/poll',
 		keyboardShortcuts: true, // Alt+Q / Alt+N / Alt+P (see KeyboardShortcuts module)
 		hideShorts: true,        // hide Shorts cards, shelves, and nav entries
+		panelBlur: true,         // blur and fade the queue panel background
 	};
 
 	const SEL = {
@@ -2903,10 +2939,16 @@
 		upNextLabel: null,
 		settingsOverlay: null,
 		panelOpen: false,
+		_panelLeaveTimer: null,
 		_dragSrcIndex: null,
 		addBtnFlash: null,
 		addBtnLabel: null,
 		_addBtnFlashTimer: null,
+
+		_applyPanelBlur() {
+			if (!this.panel) return;
+			this.panel.classList.toggle('ytqm-panel-blur', !!Settings.get().panelBlur);
+		},
 
 		init() {
 			document.getElementById('ytqm-host')?.remove();
@@ -2931,6 +2973,7 @@
 			this.root.id = 'ytqm-root';
 			this.shadow.appendChild(this.root);
 			this._buildPanel();
+			this._applyPanelBlur();
 			this._buildButtons();
 			document.body.appendChild(this.host);
 
@@ -2954,7 +2997,7 @@
 
 		_cssButtonBar() {
 			return `
-        #ytqm-root { position: fixed; bottom: 24px; left: 20px; display: flex; flex-direction: row; align-items: center; gap: 8px; pointer-events: all; }
+        #ytqm-root { position: fixed; bottom: 24px; left: 20px; display: flex; flex-direction: row; align-items: center; gap: 8px; pointer-events: all; z-index: 2; }
         .ytqm-btn { display: inline-flex; align-items: center; gap: 6px; padding: 9px 15px; border-radius: 999px; border: 1.5px solid rgba(255,255,255,0.75); cursor: pointer; font-size: 13px; font-weight: 600; font-family: 'Segoe UI', Arial, system-ui, sans-serif; letter-spacing: 0.02em; transition: transform 0.12s ease, opacity 0.12s ease, background 0.2s ease; user-select: none; white-space: nowrap; box-shadow: 0 4px 18px rgba(0,0,0,0.55); outline: none; line-height: 1; }
         .ytqm-btn:hover  { transform: scale(1.04); }
         .ytqm-btn:active { transform: scale(1); }
@@ -2975,14 +3018,15 @@
 
 		_cssQueuePanel() {
 			return `
-        #ytqm-panel { position: fixed; bottom: 68px; left: 20px; width: 330px; max-height: 480px; background: #111; border: 1.5px solid rgba(255,255,255,0.18); border-radius: 16px; box-shadow: 0 8px 40px rgba(0,0,0,0.75); display: none; flex-direction: column; overflow: hidden; color: #fff; font-family: 'Segoe UI', Arial, system-ui, sans-serif; pointer-events: all; }
-        #ytqm-panel.open { display: flex; }
+        #ytqm-panel { position: fixed; bottom: 68px; left: 20px; width: 330px; max-height: 480px; background: #111; border: 1.5px solid rgba(255,255,255,0.18); border-radius: 16px; box-shadow: 0 8px 40px rgba(0,0,0,0.75); display: flex; flex-direction: column; overflow: hidden; color: #fff; font-family: 'Segoe UI', Arial, system-ui, sans-serif; pointer-events: none; transform: translateY(calc(100% + 40px)); opacity: 0; transition: transform 0.28s cubic-bezier(0.32, 0.72, 0, 1), opacity 0.22s ease; z-index: 1; }
+        #ytqm-panel.open { pointer-events: all; transform: translateY(0); opacity: 1; }
+        #ytqm-panel.ytqm-panel-blur { background: rgba(15,15,15,0.55); backdrop-filter: blur(20px) saturate(150%); -webkit-backdrop-filter: blur(20px) saturate(150%); }
         #ytqm-panel-header { padding: 14px 16px 10px; font-size: 13px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: rgba(255,255,255,0.5); border-bottom: 1px solid rgba(255,255,255,0.08); display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
         .header-controls { display: flex; align-items: center; gap: 6px; }
         #ytqm-panel-title { cursor: pointer; transition: color 0.2s ease, text-shadow 0.2s ease; border-radius: 4px; padding: 1px 3px; margin: -1px -3px; display: inline-flex; align-items: center; gap: 6px; }
         #ytqm-panel-title:hover { color: #fff; text-shadow: 0 0 8px rgba(255,255,255,0.9), 0 0 20px rgba(255,255,255,0.4); }
-        #ytqm-cog-icon { width: 13px; height: 13px; color: rgba(255,255,255,0.3); flex-shrink: 0; transition: color 0.2s ease, transform 0.35s ease; }
-        #ytqm-panel-title:hover #ytqm-cog-icon { color: rgba(255,255,255,0.75); transform: rotate(60deg); }
+        #ytqm-cog-icon { width: 20px; height: 20px; color: #fff; flex-shrink: 0; transition: transform 0.35s ease; }
+        #ytqm-panel-title:hover #ytqm-cog-icon { transform: rotate(60deg); }
 
         /* ── Now Playing ── */
         #ytqm-now-playing { flex-shrink: 0; padding: 10px 14px 12px; border-bottom: 1px solid rgba(255,255,255,0.08); background: rgba(255,255,255,0.03); }
@@ -3067,6 +3111,7 @@
         #ytqm-settings-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.55); backdrop-filter: blur(3px); z-index: 10; display: none; align-items: center; justify-content: center; pointer-events: all; }
         #ytqm-settings-overlay.open { display: flex; }
         #ytqm-settings-modal { background: #111; border: 1.5px solid rgba(255,255,255,0.18); border-radius: 16px; box-shadow: 0 8px 40px rgba(0,0,0,0.75); width: 340px; color: #fff; font-family: 'Segoe UI', Arial, system-ui, sans-serif; overflow: hidden; }
+        .ytqm-settings-category { padding: 8px 16px 2px; font-size: 9px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: rgba(255,255,255,0.22); margin-top: 6px; }
         #ytqm-settings-header { padding: 14px 16px 10px; font-size: 13px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: rgba(255,255,255,0.5); border-bottom: 1px solid rgba(255,255,255,0.08); display: flex; align-items: center; justify-content: space-between; }
         #ytqm-settings-body { padding: 10px 0 6px; overflow-y: auto; max-height: 70vh; }
         .ytqm-setting-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 16px; border-radius: 8px; margin: 2px 6px; transition: background 0.12s; cursor: default; }
@@ -3163,9 +3208,6 @@
 				this.openSettings();
 			});
 
-			const titleText = document.createElement('span');
-			titleText.textContent = 'Queue';
-
 			const cogIcon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
 			cogIcon.setAttribute('id', 'ytqm-cog-icon');
 			cogIcon.setAttribute('viewBox', '0 0 20 20');
@@ -3173,7 +3215,7 @@
 			cogIcon.setAttribute('aria-hidden', 'true');
 			cogIcon.innerHTML = `<path fill-rule="evenodd" d="M11.49 3.17c-.38-1.56-2.6-1.56-2.98 0a1.532 1.532 0 01-2.286.948c-1.372-.836-2.942.734-2.106 2.106.54.886.061 2.042-.947 2.287-1.561.379-1.561 2.6 0 2.978a1.532 1.532 0 01.947 2.287c-.836 1.372.734 2.942 2.106 2.106a1.532 1.532 0 012.287.947c.379 1.561 2.6 1.561 2.978 0a1.533 1.533 0 012.287-.947c1.372.836 2.942-.734 2.106-2.106a1.533 1.533 0 01.947-2.287c1.561-.379 1.561-2.6 0-2.978a1.532 1.532 0 01-.947-2.287c.836-1.372-.734-2.942-2.106-2.106a1.532 1.532 0 01-2.287-.947zM10 13a3 3 0 100-6 3 3 0 000 6z" clip-rule="evenodd"/>`;
 
-			title.append(titleText, cogIcon);
+			title.append(cogIcon);
 			const controls = document.createElement('div');
 			controls.className = 'header-controls';
 			this.remotePauseBtn = document.createElement('button');
@@ -3264,6 +3306,20 @@
 				document.documentElement.classList.remove('ytqm-ui-hover');
 			});
 
+			// Auto-close: once the cursor leaves the panel, give it
+			// PANEL_AUTOCLOSE_DELAY_MS to come back before the panel closes
+			// itself. Re-entering the panel before the timer fires cancels it.
+			this.panel.addEventListener('mouseenter', () => {
+				clearTimeout(this._panelLeaveTimer);
+				this._panelLeaveTimer = null;
+			});
+			this.panel.addEventListener('mouseleave', () => {
+				clearTimeout(this._panelLeaveTimer);
+				this._panelLeaveTimer = setTimeout(() => {
+					if (this.panelOpen) this.togglePanel(false);
+				}, PANEL_AUTOCLOSE_DELAY_MS);
+			});
+
 			this._buildSettingsModal();
 		},
 
@@ -3294,7 +3350,54 @@
 			const body = document.createElement('div');
 			body.id = 'ytqm-settings-body';
 
-			const defs = [{
+			const defs = [
+				{ type: 'header', label: 'Appearance' },
+				{
+					key: 'panelBlur',
+					label: 'Frosted glass panel',
+					sub: 'Blur and fade the queue panel background for a frosted glass look.'
+				},
+				{
+					key: 'keyboardShortcuts',
+					label: 'Keyboard shortcuts',
+					sub: 'Alt+Q toggles add/remove for the current video, Alt+N skips, Alt+P goes to previous. Ignored while typing in inputs.'
+				},
+				{
+					key: 'blockContextMenu',
+					label: 'Block right-click menu',
+					sub: 'Suppress the browser context menu site-wide so right-clicking a thumbnail button always triggers \u201cplay next\u201d without the menu appearing.'
+				},
+				{ type: 'header', label: 'YouTube' },
+				{
+					key: 'hideNativeButtons',
+					label: 'Hide YouTube\'s thumbnail buttons',
+					sub: 'Suppress the native Watch Later and Add to Queue buttons that appear on hover, so only the queue manager button is shown.'
+				},
+				{
+					key: 'hideShorts',
+					label: 'Hide Shorts',
+					sub: 'Hide YouTube Shorts from search results, home feed, subscriptions, shelves, and the Shorts button in the side navigation.'
+				},
+				{ type: 'header', label: 'Phone' },
+				{
+					key: 'enqueueFromPhone',
+					label: 'Enqueue videos shared from phone',
+					sub: 'Videos shared from your Android device via the local server go straight into the queue instead of opening a new tab.'
+				},
+				{ type: 'phoneUrl' },
+				{ type: 'header', label: 'Playback' },
+				{
+					key: 'mediaSessionRefresh',
+					label: 'Aggressive MediaSession refresh',
+					sub: 'Periodically re-register next/previous track handlers. Fixes media keys going silent after YouTube reinitialises its player.'
+				},
+				{
+					key: 'mediaSessionRefreshInterval',
+					label: 'Refresh interval (seconds)',
+					sub: 'How often to re-register when aggressive refresh is on. Default: 5 s. Lower = more responsive, slightly more CPU.',
+					type: 'number'
+				},
+				{
 					key: 'remoteControls',
 					label: 'Cross-tab controls',
 					sub: 'Show pause, skip & previous buttons in the queue panel when another tab is playing.'
@@ -3309,45 +3412,55 @@
 					label: 'Always restart from beginning',
 					sub: 'Seek to 0:00 whenever the queue navigates to a video, including ones that may have partial watch progress saved by YouTube.'
 				},
-				{
-					key: 'blockContextMenu',
-					label: 'Block right-click menu',
-					sub: 'Suppress the browser context menu site-wide so right-clicking a thumbnail button always triggers "play next" without the menu appearing.'
-				},
-				{
-					key: 'mediaSessionRefresh',
-					label: 'Aggressive MediaSession refresh',
-					sub: 'Periodically re-register next/previous track handlers. Fixes media keys going silent after YouTube reinitialises its player.'
-				},
-				{
-					key: 'mediaSessionRefreshInterval',
-					label: 'Refresh interval (seconds)',
-					sub: 'How often to re-register when aggressive refresh is on. Default: 5 s. Lower = more responsive, slightly more CPU.',
-					type: 'number'
-				},
-				{
-					key: 'hideNativeButtons',
-					label: 'Hide YouTube\'s thumbnail buttons',
-					sub: 'Suppress the native Watch Later and Add to Queue buttons that appear on hover, so only the queue manager button is shown.'
-				},
-				{
-					key: 'hideShorts',
-					label: 'Hide Shorts',
-					sub: 'Hide YouTube Shorts from search results, home feed, subscriptions, shelves, and the Shorts button in the side navigation.'
-				},
-				{
-					key: 'enqueueFromPhone',
-					label: 'Enqueue videos shared from phone',
-					sub: 'Videos shared from your Android device via the local server go straight into the queue instead of opening a new tab.'
-				},
-				{
-					key: 'keyboardShortcuts',
-					label: 'Keyboard shortcuts',
-					sub: 'Alt+Q toggles add/remove for the current video, Alt+N skips, Alt+P goes to previous. Ignored while typing in inputs.'
-				},
 			];
 
+			let phoneUrlRow = null;
 			defs.forEach(def => {
+				if (def.type === 'header') {
+					const hdr = document.createElement('div');
+					hdr.className = 'ytqm-settings-category';
+					hdr.textContent = def.label;
+					body.appendChild(hdr);
+					return;
+				}
+				if (def.type === 'phoneUrl') {
+					const urlRow = document.createElement('label');
+					urlRow.className = 'ytqm-setting-row url-row';
+					const urlLabel = document.createElement('span');
+					urlLabel.className = 'ytqm-setting-label';
+					urlLabel.textContent = 'Phone server URL';
+					const urlSmall = document.createElement('small');
+					urlSmall.textContent = `Address of the /poll endpoint on your local server. Default: ${SETTINGS_DEFAULTS.phoneServerUrl}`;
+					urlLabel.appendChild(urlSmall);
+					const urlInput = document.createElement('input');
+					urlInput.id = 'ytqm-phone-url-input';
+					urlInput.type = 'text';
+					urlInput.placeholder = SETTINGS_DEFAULTS.phoneServerUrl;
+					urlInput.value = Settings.get().phoneServerUrl || SETTINGS_DEFAULTS.phoneServerUrl;
+					const isValidUrl = (val) => {
+						try { const u = new URL(val); return u.protocol === 'http:' || u.protocol === 'https:'; } catch { return false; }
+					};
+					const reflectValidity = () => {
+						const v = urlInput.value.trim();
+						const ok = !v || isValidUrl(v);
+						urlInput.style.borderColor = ok ? '' : 'rgba(231,76,60,0.85)';
+						urlInput.title = ok ? '' : 'Must be an http:// or https:// URL';
+					};
+					urlInput.addEventListener('input', reflectValidity);
+					urlInput.addEventListener('change', () => {
+						const v = urlInput.value.trim();
+						if (v && !isValidUrl(v)) { reflectValidity(); warn('Rejected invalid phoneServerUrl:', v); return; }
+						Settings.set('phoneServerUrl', v || SETTINGS_DEFAULTS.phoneServerUrl);
+						log('Setting changed: phoneServerUrl =', Settings.get().phoneServerUrl);
+						reflectValidity();
+					});
+					reflectValidity();
+					urlRow.append(urlLabel, urlInput);
+					phoneUrlRow = urlRow;
+					urlRow.style.display = Settings.get().enqueueFromPhone ? '' : 'none';
+					body.appendChild(urlRow);
+					return;
+				}
 				const row = document.createElement('label');
 				row.className = 'ytqm-setting-row';
 				const labelWrap = document.createElement('span');
@@ -3407,8 +3520,10 @@
 						if (def.key === 'mediaSessionRefresh' && Player._playing) Player._registerMediaSession();
 						if (def.key === 'hideNativeButtons') NativeButtonHider.apply();
 						if (def.key === 'hideShorts') ShortsHider.apply();
+						if (def.key === 'panelBlur') UI._applyPanelBlur();
 						if (def.key === 'enqueueFromPhone') {
 							input.checked ? PhonePoller.start() : PhonePoller.stop();
+							if (phoneUrlRow) phoneUrlRow.style.display = input.checked ? '' : 'none';
 						}
 					});
 					const track = document.createElement('span');
@@ -3421,56 +3536,6 @@
 				row.append(labelWrap, control);
 				body.appendChild(row);
 			});
-
-			// ── Phone server URL row ──────────────────────────────────────────
-			const urlRow = document.createElement('label');
-			urlRow.className = 'ytqm-setting-row url-row';
-			const urlLabel = document.createElement('span');
-			urlLabel.className = 'ytqm-setting-label';
-			urlLabel.textContent = 'Phone server URL';
-			const urlSmall = document.createElement('small');
-			urlSmall.textContent = `Address of the /poll endpoint on your local server. Default: ${SETTINGS_DEFAULTS.phoneServerUrl}`;
-			urlLabel.appendChild(urlSmall);
-			const urlInput = document.createElement('input');
-			urlInput.id = 'ytqm-phone-url-input';
-			urlInput.type = 'text';
-			urlInput.placeholder = SETTINGS_DEFAULTS.phoneServerUrl;
-			urlInput.value = Settings.get().phoneServerUrl || SETTINGS_DEFAULTS.phoneServerUrl;
-
-			// Validate that the entered string parses as a URL with an http(s)
-			// protocol. We restrict to http/https to keep the fetch surface
-			// predictable, javascript:, file:, etc. would be unsafe and have
-			// no useful semantics for the phone-poll endpoint.
-			const isValidUrl = (val) => {
-				try {
-					const u = new URL(val);
-					return u.protocol === 'http:' || u.protocol === 'https:';
-				} catch {
-					return false;
-				}
-			};
-			const reflectValidity = () => {
-				const v = urlInput.value.trim();
-				const ok = !v || isValidUrl(v); // empty is treated as "use default"
-				urlInput.style.borderColor = ok ? '' : 'rgba(231,76,60,0.85)';
-				urlInput.title = ok ? '' : 'Must be an http:// or https:// URL';
-			};
-			urlInput.addEventListener('input', reflectValidity);
-			urlInput.addEventListener('change', () => {
-				const v = urlInput.value.trim();
-				if (v && !isValidUrl(v)) {
-					// Reject the change, keep the previous setting and flag the input.
-					reflectValidity();
-					warn('Rejected invalid phoneServerUrl:', v);
-					return;
-				}
-				Settings.set('phoneServerUrl', v || SETTINGS_DEFAULTS.phoneServerUrl);
-				log('Setting changed: phoneServerUrl =', Settings.get().phoneServerUrl);
-				reflectValidity();
-			});
-			reflectValidity();
-			urlRow.append(urlLabel, urlInput);
-			body.appendChild(urlRow);
 
 			// ── Import / Export section ────────────────────────────────────────
 			const ioSection = document.createElement('div');
@@ -3541,6 +3606,8 @@
 			});
 			const urlInput = this.settingsOverlay.querySelector('#ytqm-phone-url-input');
 			if (urlInput) urlInput.value = Settings.get().phoneServerUrl || SETTINGS_DEFAULTS.phoneServerUrl;
+			const phoneUrlEl = this.settingsOverlay.querySelector('.ytqm-setting-row.url-row');
+			if (phoneUrlEl) phoneUrlEl.style.display = Settings.get().enqueueFromPhone ? '' : 'none';
 			this.settingsOverlay.classList.add('open');
 		},
 
@@ -3809,6 +3876,8 @@
 		},
 
 		togglePanel(force) {
+			clearTimeout(this._panelLeaveTimer);
+			this._panelLeaveTimer = null;
 			this.panelOpen = force !== undefined ? force : !this.panelOpen;
 			if (this.panelOpen) {
 				this.refreshPanel();
