@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name YouTube Queue Manager
 // @namespace https://github.com/Alpacinator/Youtube-Custom-Queue/
-// @version 2.4.0
+// @version 2.4.1
 // @description A persistent, cross-tab YouTube queue manager with drag-to-reorder, auto-advance, and optional auto theater mode.
 // @match *://*.youtube.com/*
 // @grant none
@@ -350,6 +350,7 @@
 		keyboardShortcuts: true, // Alt+Q / Alt+N / Alt+P (see KeyboardShortcuts module)
 		hideShorts: true,        // hide Shorts cards, shelves, and nav entries
 		panelBlur: true,         // blur and fade the queue panel background
+		hideInterruptionsBanner: true, // hide the "Experiencing interruptions?" bar
 	};
 
 	const SEL = {
@@ -1952,6 +1953,32 @@
 				added
 			};
 		},
+
+		exportToFile() {
+			const state = Storage.load();
+			const payload = {
+				_ytqm: true,
+				exportedAt: new Date().toISOString(),
+				queue: state.queue.map(({ url, title, channel }) => ({ url, title, channel })),
+			};
+			try {
+				const json = JSON.stringify(payload, null, 2);
+				const blob = new Blob([json], { type: 'application/json' });
+				const blobUrl = URL.createObjectURL(blob);
+				const a = document.createElement('a');
+				a.href = blobUrl;
+				a.download = `yt-queue-${new Date().toISOString().slice(0, 10)}.json`;
+				document.body.appendChild(a);
+				a.click();
+				document.body.removeChild(a);
+				URL.revokeObjectURL(blobUrl);
+				log('Exported', payload.queue.length, 'items to file');
+				return { ok: true, count: payload.queue.length };
+			} catch (e) {
+				warn('exportToFile failed:', e);
+				return { ok: false, count: 0 };
+			}
+		},
 	};
 
 	// ── PhonePoller ───────────────────────────────────────────────────────────
@@ -3110,11 +3137,14 @@
 			return `
         #ytqm-settings-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.55); backdrop-filter: blur(3px); z-index: 10; display: none; align-items: center; justify-content: center; pointer-events: all; }
         #ytqm-settings-overlay.open { display: flex; }
-        #ytqm-settings-modal { background: #111; border: 1.5px solid rgba(255,255,255,0.18); border-radius: 16px; box-shadow: 0 8px 40px rgba(0,0,0,0.75); width: 340px; color: #fff; font-family: 'Segoe UI', Arial, system-ui, sans-serif; overflow: hidden; }
-        .ytqm-settings-category { padding: 8px 16px 2px; font-size: 9px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: rgba(255,255,255,0.22); margin-top: 6px; }
+        #ytqm-settings-modal { background: #111; border: 1.5px solid rgba(255,255,255,0.18); border-radius: 16px; box-shadow: 0 8px 40px rgba(0,0,0,0.75); width: min(780px, 96vw); max-height: 85vh; color: #fff; font-family: 'Segoe UI', Arial, system-ui, sans-serif; overflow: hidden; display: flex; flex-direction: column; }
+        #ytqm-settings-content { display: flex; flex: 1; min-height: 0; overflow: hidden; }
+        .ytqm-settings-category { padding: 8px 16px 2px; font-size: 9px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: rgba(255,255,255,0.22); margin-top: 6px; break-after: avoid; break-inside: avoid; }
+        .ytqm-category-wrap { break-inside: avoid; }
+        .ytqm-category-wrap[data-column-break] { break-before: column; }
         #ytqm-settings-header { padding: 14px 16px 10px; font-size: 13px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: rgba(255,255,255,0.5); border-bottom: 1px solid rgba(255,255,255,0.08); display: flex; align-items: center; justify-content: space-between; }
-        #ytqm-settings-body { padding: 10px 0 6px; overflow-y: auto; max-height: 70vh; }
-        .ytqm-setting-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 16px; border-radius: 8px; margin: 2px 6px; transition: background 0.12s; cursor: default; }
+        #ytqm-settings-body { flex: 1; padding: 10px 0 6px; overflow-y: auto; columns: 2; column-gap: 0; min-height: 0; }
+        .ytqm-setting-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 16px; border-radius: 8px; margin: 2px 6px; transition: background 0.12s; cursor: default; break-inside: avoid; }
         .ytqm-setting-row:hover { background: rgba(255,255,255,0.05); }
         .ytqm-setting-label { font-size: 12.5px; color: rgba(255,255,255,0.8); line-height: 1.4; flex: 1; }
         .ytqm-setting-label small { display: block; font-size: 11px; color: rgba(255,255,255,0.35); margin-top: 2px; font-weight: 400; }
@@ -3127,16 +3157,22 @@
         #ytqm-phone-url-input:focus { outline: none; border-color: rgba(255,255,255,0.45); }
 
         /* ── Import / Export section ── */
-        #ytqm-io-section { border-top: 1px solid rgba(255,255,255,0.08); margin: 8px 0 0; padding: 12px 16px 14px; }
+        #ytqm-io-section { width: 195px; flex-shrink: 0; border-left: 1px solid rgba(255,255,255,0.08); padding: 16px 14px; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; }
         #ytqm-io-title { font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: rgba(255,255,255,0.3); margin-bottom: 10px; }
-        .ytqm-io-row { display: flex; gap: 8px; margin-bottom: 0; align-items: center; }
-        .ytqm-io-btn { flex: 1; background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.18); border-radius: 8px; color: rgba(255,255,255,0.8); font-size: 12px; font-weight: 600; font-family: inherit; padding: 7px 10px; cursor: pointer; transition: background 0.15s, color 0.15s; white-space: nowrap; text-align: center; }
+        .ytqm-io-row { display: flex; flex-direction: column; gap: 6px; margin-bottom: 0; }
+        .ytqm-io-btn { width: 100%; background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.18); border-radius: 8px; color: rgba(255,255,255,0.8); font-size: 12px; font-weight: 600; font-family: inherit; padding: 7px 10px; cursor: pointer; transition: background 0.15s, color 0.15s; white-space: nowrap; text-align: center; }
         .ytqm-io-btn:hover { background: rgba(255,255,255,0.13); color: #fff; }
         .ytqm-io-btn.accent { background: rgba(39,174,96,0.15); border-color: rgba(39,174,96,0.35); color: rgba(39,174,96,0.9); }
         .ytqm-io-btn.accent:hover { background: rgba(39,174,96,0.25); color: #2ecc71; }
         #ytqm-io-status { font-size: 11px; color: rgba(255,255,255,0.35); min-height: 16px; transition: color 0.2s; margin-top: 8px; text-align: center; }
         #ytqm-io-status.ok  { color: rgba(46,204,113,0.85); }
         #ytqm-io-status.err { color: rgba(231,76,60,0.9); }
+        @media (max-width: 600px) {
+            #ytqm-settings-modal { width: 95vw; max-height: 90vh; }
+            #ytqm-settings-content { flex-direction: column; overflow-y: auto; }
+            #ytqm-settings-body { columns: 1; overflow: visible; }
+            #ytqm-io-section { width: auto; border-left: none; border-top: 1px solid rgba(255,255,255,0.08); }
+        }
       `;
 		},
 
@@ -3378,7 +3414,12 @@
 					label: 'Hide Shorts',
 					sub: 'Hide YouTube Shorts from search results, home feed, subscriptions, shelves, and the Shorts button in the side navigation.'
 				},
-				{ type: 'header', label: 'Phone' },
+				{
+					key: 'hideInterruptionsBanner',
+					label: 'Hide interruptions banner',
+					sub: 'Hide the "Experiencing interruptions?" notification bar that appears below the video.'
+				},
+				{ type: 'header', label: 'Phone', columnBreak: true },
 				{
 					key: 'enqueueFromPhone',
 					label: 'Enqueue videos shared from phone',
@@ -3415,12 +3456,17 @@
 			];
 
 			let phoneUrlRow = null;
+			let currentCategoryWrapper = null;
 			defs.forEach(def => {
 				if (def.type === 'header') {
+					currentCategoryWrapper = document.createElement('div');
+					currentCategoryWrapper.className = 'ytqm-category-wrap';
+					if (def.columnBreak) currentCategoryWrapper.dataset.columnBreak = 'true';
 					const hdr = document.createElement('div');
 					hdr.className = 'ytqm-settings-category';
 					hdr.textContent = def.label;
-					body.appendChild(hdr);
+					currentCategoryWrapper.appendChild(hdr);
+					body.appendChild(currentCategoryWrapper);
 					return;
 				}
 				if (def.type === 'phoneUrl') {
@@ -3458,7 +3504,7 @@
 					urlRow.append(urlLabel, urlInput);
 					phoneUrlRow = urlRow;
 					urlRow.style.display = Settings.get().enqueueFromPhone ? '' : 'none';
-					body.appendChild(urlRow);
+					(currentCategoryWrapper || body).appendChild(urlRow);
 					return;
 				}
 				const row = document.createElement('label');
@@ -3520,6 +3566,7 @@
 						if (def.key === 'mediaSessionRefresh' && Player._playing) Player._registerMediaSession();
 						if (def.key === 'hideNativeButtons') NativeButtonHider.apply();
 						if (def.key === 'hideShorts') ShortsHider.apply();
+						if (def.key === 'hideInterruptionsBanner') InterruptionsBannerHider.apply();
 						if (def.key === 'panelBlur') UI._applyPanelBlur();
 						if (def.key === 'enqueueFromPhone') {
 							input.checked ? PhonePoller.start() : PhonePoller.stop();
@@ -3534,7 +3581,7 @@
 					control = toggle;
 				}
 				row.append(labelWrap, control);
-				body.appendChild(row);
+				(currentCategoryWrapper || body).appendChild(row);
 			});
 
 			// ── Import / Export section ────────────────────────────────────────
@@ -3588,11 +3635,22 @@
 				else setIoStatus(error, 'err');
 			});
 
-			ioRow.append(exportBtn, importBtn);
-			ioSection.append(ioTitle, ioRow, ioStatus);
-			body.appendChild(ioSection);
+			const downloadBtn = document.createElement('button');
+			downloadBtn.className = 'ytqm-io-btn';
+			downloadBtn.textContent = 'Save to File';
+			downloadBtn.title = 'Download the current queue as a JSON file';
+			downloadBtn.addEventListener('click', () => {
+				const { ok, count } = QueueIO.exportToFile();
+				if (ok) setIoStatus(`Saved ${count} item${count !== 1 ? 's' : ''} to file`, 'ok');
+				else setIoStatus('File save failed', 'err');
+			});
 
-			modal.append(header, body);
+			ioRow.append(exportBtn, importBtn, downloadBtn);
+			ioSection.append(ioTitle, ioRow, ioStatus);
+			const content = document.createElement('div');
+			content.id = 'ytqm-settings-content';
+			content.append(body, ioSection);
+			modal.append(header, content);
 			this.settingsOverlay.appendChild(modal);
 			this.shadow.appendChild(this.settingsOverlay);
 		},
@@ -4132,6 +4190,28 @@
 		},
 	};
 
+	const InterruptionsBannerHider = {
+		_styleEl: null,
+		_CSS: [
+			'ytd-mealbar-promo-renderer{display:none!important}',
+			'yt-mealbar-promo-renderer-view-model{display:none!important}',
+		].join(''),
+		apply() {
+			const shouldHide = Settings.get().hideInterruptionsBanner;
+			if (shouldHide && !this._styleEl) {
+				this._styleEl = document.createElement('style');
+				this._styleEl.id = 'ytqm-hide-interruptions';
+				this._styleEl.textContent = this._CSS;
+				document.head.appendChild(this._styleEl);
+				log('InterruptionsBannerHider: hidden');
+			} else if (!shouldHide && this._styleEl) {
+				this._styleEl.remove();
+				this._styleEl = null;
+				log('InterruptionsBannerHider: restored');
+			}
+		},
+	};
+
 	// ── URL Change Detection ──────────────────────────────────────────────────
 
 	let lastUrl = location.href;
@@ -4345,6 +4425,7 @@
 		ContextMenuBlocker.init();
 		NativeButtonHider.apply();
 		ShortsHider.apply();
+		InterruptionsBannerHider.apply();
 		KeyboardShortcuts.init();
 		if (Page.isWatchPage()) TheaterMode.init();
 		if (Settings.get().enqueueFromPhone) PhonePoller.start();
