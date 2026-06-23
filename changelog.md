@@ -2,6 +2,13 @@
 
 All notable changes to the YouTube Queue Manager userscript. Version numbers correspond to the `@version` metadata in `yt-q.user.js`.
 
+## 2.5.1 (vs 2.5.0)
+
+### Bug Fixes
+
+- **"Always restart from beginning" had no effect on previously-watched videos**
+  When the setting was on, the script set the bare `<video>.currentTime = 0` and played. For a video you had watched before, YouTube resumes it at the saved timestamp by issuing its own seek during player init, and that seek frequently landed after ours and clobbered it, so the video played from the middle. Writing the raw element's currentTime is also unreliable because YouTube drives playback through its MSE player rather than the `<video>` element. The setting now seeks through the player API (`#movie_player.seekTo(0)`) and reasserts the seek a few times over the first ~1.2 s to win the race against YouTube's resume seek, stopping once playback is settled near the start so it never fights a deliberate user scrub. When the setting is off, the script no longer touches the start position at all and leans entirely on YouTube's native behaviour, so previously-watched videos resume where you left off exactly as they would without the script.
+
 ## 2.5.0 (vs 2.4.3)
 
 ### New Features
