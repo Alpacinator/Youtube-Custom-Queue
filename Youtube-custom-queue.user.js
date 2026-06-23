@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name YouTube Queue Manager
 // @namespace https://github.com/Alpacinator/Youtube-Custom-Queue/
-// @version 2.5.0
+// @version 2.5.1
 // @description A persistent, cross-tab YouTube queue manager with drag-to-reorder, auto-advance, and optional auto theater mode.
 // @match *://*.youtube.com/*
 // @grant none
@@ -61,7 +61,7 @@
 	// metadata at the top of this file; both must be bumped together. The
 	// public API exposes this as window.ytQueueManager.version, and the boot
 	// banner prints it so users can verify which build is actually running.
-	const VERSION = '2.5.0';
+	const VERSION = '2.5.1';
 
 	const STORAGE_KEY = 'yt_queue_manager_v1';
 	const PLAYING_KEY = 'yt_queue_playing_tab';
@@ -1278,21 +1278,71 @@
 			const play = () => {
 				video.play().catch(() => this._clickPlayButton());
 			};
-			const seekThenPlay = () => {
-				video.currentTime = 0;
-				video.addEventListener('seeked', play, {
-					once: true
-				});
-			};
 			const whenReady = (fn) => {
 				if (video.readyState >= 3) fn();
 				else video.addEventListener('canplay', fn, {
 					once: true
 				});
 			};
-			// Do NOT pause here, calling video.pause() while YouTube is still
-			// initialising its player causes YouTube to show an error screen.
-			whenReady(restartFromBeginning ? seekThenPlay : play);
+
+			if (!restartFromBeginning) {
+				// Default behaviour: lean entirely on YouTube for the start
+				// position. We only call play() so the queue auto-advances; we
+				// deliberately never touch currentTime / seekTo here, so a video
+				// you've watched before resumes at YouTube's saved timestamp,
+				// exactly as it would without this script.
+				// Do NOT pause here, calling video.pause() while YouTube is still
+				// initialising its player causes YouTube to show an error screen.
+				whenReady(play);
+				return;
+			}
+
+			// Restart-from-beginning is fragile to do via video.currentTime = 0:
+			// YouTube resumes previously-watched videos at the saved timestamp by
+			// issuing its OWN seek during player init, and that seek frequently
+			// lands AFTER ours, clobbering it so the video plays from the middle.
+			// Writing the bare <video>.currentTime is also unreliable because
+			// YouTube drives playback through its MSE player, not the element.
+			//
+			// Fix: seek through the player API (#movie_player.seekTo) which is the
+			// player's own source of truth, and reassert it a few times over the
+			// first ~1.2s to win the race against YouTube's resume seek. We stop
+			// reasserting as soon as playback is at/near the start, or after the
+			// attempt budget is spent, so we never fight a deliberate user seek
+			// made after playback has settled.
+			const player = document.querySelector('#movie_player');
+			const canApi = player && typeof player.seekTo === 'function';
+
+			const seekToStart = () => {
+				if (canApi) player.seekTo(0, true);
+				else video.currentTime = 0; // last-resort fallback
+			};
+
+			whenReady(() => {
+				seekToStart();
+				play();
+				let attempts = 0;
+				const MAX_ATTEMPTS = 6;      // ~1.2s at 200ms spacing
+				const REASSERT_MS = 200;
+				const SETTLED_S = 1.5;       // if we're already past this, assume
+				                             // YouTube isn't going to resume-seek
+				const reassert = () => {
+					if (!this._playing || video.ended) return;
+					if (++attempts > MAX_ATTEMPTS) return;
+					const t = canApi && typeof player.getCurrentTime === 'function'
+						? player.getCurrentTime()
+						: video.currentTime;
+					// If something pushed us into the video (YouTube's resume seek),
+					// pull it back to 0. Once playback is comfortably past the start
+					// without having been yanked forward, stop, the user may be
+					// scrubbing intentionally.
+					if (!isNaN(t) && t > SETTLED_S) {
+						seekToStart();
+					}
+					setTimeout(reassert, REASSERT_MS);
+				};
+				setTimeout(reassert, REASSERT_MS);
+			});
 		},
 
 		_detachVideoListeners() {
