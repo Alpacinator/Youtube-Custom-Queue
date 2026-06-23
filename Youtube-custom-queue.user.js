@@ -1,247 +1,15 @@
 // ==UserScript==
 // @name YouTube Queue Manager
 // @namespace https://github.com/Alpacinator/Youtube-Custom-Queue/
-// @version 2.4.2
+// @version 2.5.0
 // @description A persistent, cross-tab YouTube queue manager with drag-to-reorder, auto-advance, and optional auto theater mode.
 // @match *://*.youtube.com/*
 // @grant none
 // @run-at document-start
 // ==/UserScript==
 
-/**
- * ─────────────────────────────────────────────────────────────────────────────
- * CHANGELOG
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * 2.4.0 (vs 2.3.2)
- * -----------------
- *
- * NEW FEATURES
- *
- *   Settings reorganisation with category headers
- *     The settings modal is now divided into four labelled sections:
- *     Appearance, YouTube, Phone, and Playback. Items are reordered so
- *     related controls sit together. Cross-tab controls, Auto theater
- *     mode, and Always restart from beginning are now grouped under
- *     Playback.
- *
- *   Frosted glass queue panel  (settings toggle, default ON)
- *     A new Appearance toggle applies backdrop-filter blur and a
- *     semi-transparent background to the queue panel, giving it a
- *     frosted glass look. Toggling it off restores the solid dark
- *     background.
- *
- *   Phone Server URL shown only when Enqueue from phone is on
- *     The Phone server URL input now lives directly below the Enqueue
- *     from phone toggle and is hidden whenever that toggle is off.
- *     It reappears immediately when the toggle is turned on, keeping
- *     the settings list uncluttered.
- *
- * UI CHANGES
- *
- *   Panel header: title text removed, cog icon enlarged and whitened
- *     The word Queue has been removed from the panel header title
- *     area. The settings cog is the sole interactive element there.
- *     The icon is enlarged from 13 px to 20 px and rendered in solid
- *     white for better visibility against the panel background.
- *
- * -----------------------------------------------------------------------------
- *
- * 2.3.2 (vs 2.3.1)
- * -----------------
- *
- * BUG FIXES
- *
- *   Navigation starts before the video has ended
- *     The timeupdate handler triggered advance() whenever the remaining time
- *     fell at or below VIDEO_END_THRESHOLD_S (2 seconds), causing the queue
- *     to visibly navigate away while the video was still playing. The ended
- *     event and _scheduleEndPoll together already handle genuine end-of-video
- *     detection reliably; the early-fire threshold in timeupdate was the only
- *     path that produced this symptom. The threshold check is removed from
- *     the timeupdate handler so it now only advances on video.ended === true.
- *     _scheduleEndPoll retains the threshold as a safety net for YouTube paths
- *     that drop the ended event near the end of a video.
- *
- * -----------------------------------------------------------------------------
- *
-
- * -----------------
- *
- * BUG FIXES
- *
- *   Double-advance guard
- *     advance() had no reentrancy guard. The three end-detection paths
- *     (timeupdate, the ended event, the end-poll timer) plus the manual
- *     skip controls could each call advance() in separate tasks while
- *     _playing stayed true and the next video had not yet attached,
- *     shifting two entries off the queue and skipping a video the user
- *     never saw. A new _advancing flag is set in advance() and cleared
- *     once the next video attaches (_onVideoReady), on stop(), on start(),
- *     and on the unplayable-skip path. Fast skip presses now advance one
- *     item at a time instead of racing.
- *
- *   Queue array validation on load
- *     Storage.load() validated history was an array but not queue. A
- *     parseable but corrupt state with a missing queue threw inside
- *     _rebuildSet and dropped the user back to defaults, losing history
- *     too. queue is now coerced to [] like history.
- *
- * MISC
- *
- *   Extracted two stray magic numbers (remote-stop pause delay, unplayable
- *   skip delay) into named constants. Routed two watch-URL builders through
- *   the existing getVideoId/watchUrl helpers. Bounded the overlay reparent
- *   MutationObserver with a disconnect timeout. Removed decorative emoji
- *   from user-facing strings.
- *
- * -----------------------------------------------------------------------------
- *
- * 2.3.0 (vs 2.2.0)
- * -----------------
- *
- * CROSS-TAB CONTROLS
- *
- *   The Prev / Pause / Skip buttons inside the queue panel already existed
- *   as of 2.2.0 and worked correctly. What was missing was any indication
- *   on the button bar itself that another tab was playing, making it unclear
- *   whether the queue was active at all when you switched tabs.
- *
- *   Play button - remote state
- *     The main Play Queue button now has three visual states:
- *       • ▶ Play Queue (n)         - nothing playing anywhere, default dark.
- *       • ■ Stop Queue             - this tab is playing, red (unchanged).
- *       • ■ Stop Queue (other tab) - another tab owns playback, blue.
- *     The blue state appears as soon as the playing tab's heartbeat is
- *     detected and disappears within one HEARTBEAT_TTL_MS window (10 s)
- *     after the other tab stops. updateControls() now also fires on
- *     heartbeat/PLAYING_KEY storage events so the transition is prompt.
- *
- *   Remote stop signal
- *     Clicking the blue "Stop Queue (other tab)" button writes a timestamp
- *     to yt_queue_stop_signal in localStorage (same pattern as the existing
- *     skip signal). The playing tab's storage listener picks it up, pauses
- *     the video first, waits 300 ms for the browser to render the paused
- *     frame, then calls Player.stop(). Pausing first gives the user on the
- *     playing tab a visible cue that something happened before the queue UI
- *     tears down. If the video is already paused or ended, stop() is called
- *     immediately with no delay.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * 2.2.0 (vs 2.1.8)
- * -----------------
- *
- * NEW FEATURES
- *
- *   Hide Shorts  (settings toggle, default ON)
- *     Injects a single CSS rule that hides Shorts from every surface:
- *     search results (ytd-video-renderer), home/subscriptions grid cards
- *     (ytd-rich-item-renderer), compact list cards, grid shelf rows
- *     (grid-shelf-view-model), dedicated Shorts shelves
- *     (ytd-reel-shelf-renderer), the section wrappers around those shelves,
- *     and both the mini-guide and full sidebar Shorts navigation entries.
- *     Toggle off in settings to restore them instantly.
- *
- *   oEmbed title fetch on phone share
- *     When a video URL shared from the phone arrives without a title (e.g.
- *     a bare-URL share), the title is now fetched from YouTube's public
- *     oEmbed endpoint (youtube.com/oembed?url=…&format=json) before the
- *     entry is added to the queue. Works on www.youtube.com (same-origin,
- *     no CORS issue). Falls back silently to "Shared from phone" on any
- *     error (timeout, 401 for private/age-gated videos, network failure).
- *
- *   Navigator documentation
- *     Extensive block comment added to the Navigator module explaining why
- *     anchor-hijacking was chosen over the obvious alternatives (YouTube's
- *     internal API, dispatching yt-navigate directly, history.pushState),
- *     and exactly why each of those alternatives doesn't work reliably.
- *
- * BUG FIXES
- *
- *   Zombie _waitForVideo timers (was: queue advances after manual stop)
- *     _waitForVideo scheduled three timers (poll interval, 30s fallback,
- *     early-unavailable check) that lived only in closure scope. Player.stop()
- *     had no reference to them and couldn't cancel them. 30 seconds after a
- *     manual stop, the fallback timer would fire, call _skipUnplayable(), and
- *     advance the queue - visibly navigating to the "next" video even though
- *     the queue was stopped. Fixed by stashing all three handles on
- *     this._waitForVideoHandles and clearing them in stop(). Every callback
- *     also re-checks this._playing before acting.
- *
- *   Zombie end-poll timer (was: next video silently skipped without playing)
- *     advance() and _skipUnplayable() detached event listeners but never
- *     cleared the end-poll setTimeout. The old video's ended flag stayed true
- *     on the reused <video> element, so if the 1-second poll fired before the
- *     new video's _attachVideoListeners had a chance to call _clearEndPoll,
- *     the orphan timer called advance() again - pushing the next entry into
- *     history and navigating past it without it ever playing. Fixed by calling
- *     _clearEndPoll() in both advance() and _skipUnplayable().
- *
- *   Queue not stopping on navigate-away
- *     Navigating off a watch page while the queue was playing (clicking the
- *     YouTube logo, going to subscriptions, etc.) left Player._playing = true
- *     with no video to attach to. The queue never stopped on its own; the
- *     stop button was the only exit. Fixed in onUrlChange(): if _playing is
- *     true and the new URL is not a watch page, Player.stop() is called.
- *
- *   Boot-recovery false positives (was: new tab stole playback from another)
- *     Boot recovery checks Storage.playing and resumes if true. Storage.playing
- *     is a shared localStorage flag set by any tab that starts the queue and
- *     cleared only by stop(). A new tab opening while another tab was playing
- *     would see playing=true, call Player.start(), steal ownership, and
- *     forcibly navigate itself to the queue head. Fixed by also requiring the
- *     boot URL to match the queue head's video ID - the unambiguous "user
- *     refreshed mid-queue on the watch page" signal.
- *
- *   Thumbnail buttons missing on search results
- *     Buttons were injected onto ytd-video-renderer (the SEL.CARD match for
- *     search results), which is a Polymer custom element. Polymer's shady-DOM
- *     rendering swallows children appended from outside the component, giving
- *     them a 0×0 getBoundingClientRect and making them invisible. Fixed by
- *     changing the container argument in _injectStandard from card to anchor:
- *     _injectButton(anchor, anchor, card). The thumbnail anchor is a plain
- *     <a> tag that is reliable across all layouts. card is still passed as the
- *     third argument so hover tracking and the _cards map are unchanged.
- *
- *   Overlay button blocked by stacking context on search results
- *     The body-level overlay button was added to solve the z-index issue where
- *     YouTube's singleton inline-preview (ytd-video-preview / vpNode) covered
- *     the card-mounted button. But on search pages, certain ancestor elements
- *     create a sealed stacking context that traps position:fixed elements in
- *     the body context rather than the viewport - so vpNode still won.
- *     Fixed by reparenting the overlay button into #video-preview (vpNode's
- *     grandparent), putting it in vpNode's own stacking context where a high
- *     z-index reliably wins. A MutationObserver handles the case where
- *     #video-preview doesn't exist yet at boot. Positioning uses a probe
- *     (set left:0/top:0, read actual rect, subtract) to handle transformed
- *     containing blocks where position:fixed is relative to the ancestor
- *     rather than the viewport.
- *
- *   Overlay and card button rendering simultaneously (visible doubling)
- *     Both the per-card button and the overlay button were visible at the
- *     same position on most layouts, causing subtle doubling from box-shadow
- *     rendering differences. Fixed by toggling html.ytqm-overlay-active when
- *     the overlay is shown, which suppresses all per-card buttons via CSS.
- *     The per-card buttons still exist as state holders and forwarding targets.
- *
- *   Button flash-and-disappear on vpNode activation (especially first-column)
- *     When YouTube's inline preview activated, the button would briefly flash
- *     then disappear. Root cause: mouseleave fired on the card when vpNode
- *     appeared on top; the relatedTarget was inside vpNode but vpNode's href
- *     wasn't loaded yet (async), so the URL-match fallback in findEntry
- *     returned null; the hide timer fired and hid the overlay. For first-
- *     column / edge cards, vpNode is sometimes offset from the card (to avoid
- *     overflowing off-screen left), creating a brief cursor gap that could
- *     also trigger the hide timer before the cursor reached vpNode.
- *     Fixed with two additions to the hover handlers:
- *       mouseleave: explicitly check rel.closest(SEL.VIDEO_PREVIEW) and
- *         return early regardless of URL-match state.
- *       mouseenter: if target is inside vpNode and _currentHoverCard has a
- *         pending hide timer, cancel it - handles the cursor-gap scenario.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- */
+// Changelog moved to CHANGELOG.md (kept out of the script to reduce its
+// size). See that file for the full per-version history.
 
 /**
  * ─────────────────────────────────────────────────────────────────────────────
@@ -293,7 +61,7 @@
 	// metadata at the top of this file; both must be bumped together. The
 	// public API exposes this as window.ytQueueManager.version, and the boot
 	// banner prints it so users can verify which build is actually running.
-	const VERSION = '2.4.0';
+	const VERSION = '2.5.0';
 
 	const STORAGE_KEY = 'yt_queue_manager_v1';
 	const PLAYING_KEY = 'yt_queue_playing_tab';
@@ -1287,17 +1055,24 @@
 					this._endPollTimer = setTimeout(check, 1000);
 					return;
 				}
-				const remaining = video.duration - video.currentTime;
-				const ended = video.ended || (!isNaN(remaining) && remaining <= VIDEO_END_THRESHOLD_S);
-				if (ended) {
-					log('Video ended, advancing queue');
+				// Only advance on video.ended. The remaining <= VIDEO_END_THRESHOLD_S
+				// early-fire check was removed here for the same reason it was removed
+				// from the timeupdate handler in 2.3.2: it caused the queue to advance
+				// while the video still had up to 2 seconds left. video.ended is set by
+				// the browser even on paths that drop the ended event, so the safety-net
+				// goal is preserved with a worst-case lag of one poll tick (~1 s).
+				if (video.ended) {
+					log('End poll: video.ended, advancing queue');
 					this._userPaused = false;
 					Storage.setPaused(false);
 					this.advance();
-				} else if (!isNaN(remaining) && remaining > 30) {
-					this._endPollTimer = setTimeout(check, (remaining - 28) * 1000);
 				} else {
-					this._endPollTimer = setTimeout(check, 1000);
+					const remaining = video.duration - video.currentTime;
+					if (!isNaN(remaining) && remaining > 30) {
+						this._endPollTimer = setTimeout(check, (remaining - 28) * 1000);
+					} else {
+						this._endPollTimer = setTimeout(check, 1000);
+					}
 				}
 			};
 			const remaining = video.duration - video.currentTime;
@@ -4192,22 +3967,60 @@
 
 	const InterruptionsBannerHider = {
 		_styleEl: null,
+		_observer: null,
+		// CSS fallback for the promotional mealbar variant of the message
+		// ("Experiencing interruptions? Try YouTube TV" etc.).
 		_CSS: [
 			'ytd-mealbar-promo-renderer{display:none!important}',
 			'yt-mealbar-promo-renderer-view-model{display:none!important}',
 		].join(''),
+		// The common "Experiencing interruptions?" notification is a
+		// tp-yt-paper-toast added dynamically to ytd-popup-container. Its #text
+		// element is populated asynchronously after insertion, so we check once
+		// immediately then retry after a short delay to catch the async render.
+		_handleToast(toast) {
+			const tryRemove = () => {
+				const textEl = toast.querySelector('#text');
+				if (textEl && textEl.textContent.includes('Experiencing interruptions')) {
+					toast.remove();
+					log('InterruptionsBannerHider: removed interruptions toast');
+					return true;
+				}
+				return false;
+			};
+			if (!tryRemove()) setTimeout(tryRemove, 400);
+		},
 		apply() {
 			const shouldHide = Settings.get().hideInterruptionsBanner;
-			if (shouldHide && !this._styleEl) {
-				this._styleEl = document.createElement('style');
-				this._styleEl.id = 'ytqm-hide-interruptions';
-				this._styleEl.textContent = this._CSS;
-				document.head.appendChild(this._styleEl);
-				log('InterruptionsBannerHider: hidden');
-			} else if (!shouldHide && this._styleEl) {
-				this._styleEl.remove();
-				this._styleEl = null;
-				log('InterruptionsBannerHider: restored');
+			if (shouldHide) {
+				if (!this._styleEl) {
+					this._styleEl = document.createElement('style');
+					this._styleEl.id = 'ytqm-hide-interruptions';
+					this._styleEl.textContent = this._CSS;
+					document.head.appendChild(this._styleEl);
+				}
+				if (!this._observer) {
+					this._observer = new MutationObserver(mutations => {
+						if (!Settings.get().hideInterruptionsBanner) return;
+						for (const m of mutations) {
+							for (const node of m.addedNodes) {
+								if (node.nodeType !== 1) continue;
+								if (node.matches?.('tp-yt-paper-toast')) {
+									this._handleToast(node);
+								} else {
+									node.querySelectorAll?.('tp-yt-paper-toast')
+										.forEach(n => this._handleToast(n));
+								}
+							}
+						}
+					});
+					this._observer.observe(document.body, { childList: true, subtree: true });
+					log('InterruptionsBannerHider: observer active');
+				}
+			} else {
+				if (this._styleEl) { this._styleEl.remove(); this._styleEl = null; }
+				if (this._observer) { this._observer.disconnect(); this._observer = null; }
+				log('InterruptionsBannerHider: disabled');
 			}
 		},
 	};
@@ -4240,6 +4053,7 @@
 		if (UI.panelOpen) UI.refreshPanel();
 		if (Page.isWatchPage()) TheaterMode.init();
 		ThumbnailInjector.syncAllButtons();
+		SelectorHealth.scheduleCheck();
 	}
 
 	window.addEventListener('popstate', () => {
@@ -4382,6 +4196,98 @@
 		},
 	};
 
+	// ── Selector Health Check ─────────────────────────────────────────────────
+	//
+	// This script depends on YouTube's internal element names and class hooks,
+	// which YouTube renames without notice (see the SEL object and the Navigator
+	// block comment). When that happens a feature stops working *silently* - the
+	// queue just quietly fails to advance, the title scrape returns empty, the
+	// theater toggle does nothing - and there's no signal pointing at which
+	// selector died.
+	//
+	// SelectorHealth turns that silent failure into a named console warning. It
+	// probes the critical selectors a short while after navigation settles and,
+	// for any that resolve to nothing on a page where they *should* match, logs
+	// one warning identifying the selector and the feature it powers. It is
+	// purely diagnostic: it never throws, never mutates the page, and never
+	// changes behaviour. The warnings are throttled to once per selector key per
+	// session so a persistently-broken selector doesn't spam the console on
+	// every navigation.
+	//
+	// Run it on demand from the console with:
+	//   window.ytQueueManager.checkSelectors()
+	// which ignores the once-per-session throttle and re-reports everything.
+
+	const SelectorHealth = {
+		_warned: new Set(),
+
+		// Each probe names the SEL entry (or literal selector), the feature it
+		// backs, and where it should resolve. `where` controls when a miss is
+		// meaningful:
+		//   'watch'  - only expected on a watch page (player, title, etc.)
+		//   'any'    - expected on essentially every YouTube page (the cards
+		//              grid, the thumbnail observer roots)
+		// `optional: true` marks selectors that legitimately may be absent (e.g.
+		// the inline-preview node only exists once the user hovers a thumbnail);
+		// those are checked only by the on-demand console call, never auto-run.
+		_probes: [
+			{ key: 'PLAYER',        sel: SEL.PLAYER,        feature: 'Player attach / playback control', where: 'watch' },
+			{ key: 'WATCH_TITLE',   sel: SEL.WATCH_TITLE,   feature: 'Watch-page title scrape (queue add)', where: 'watch' },
+			{ key: 'WATCH_FLEXY',   sel: SEL.WATCH_FLEXY,   feature: 'Theater-mode state detection',        where: 'watch' },
+			{ key: 'CARD',          sel: SEL.CARD,          feature: 'Thumbnail "+" button injection',      where: 'any' },
+			{ key: 'THUMB_ROOTS',   sel: SEL.THUMB_OBSERVER_ROOTS, feature: 'Thumbnail MutationObserver roots', where: 'any' },
+			{ key: 'POPUP_TOAST',   sel: 'ytd-popup-container', feature: 'Interruptions-banner observer root', where: 'any' },
+			{ key: 'THEATER_BTN',   sel: `${SEL.THEATER_BTN_DATA}, ${SEL.THEATER_BTN_CLASS}`, feature: 'Theater-mode toggle button', where: 'watch', optional: true },
+			{ key: 'VIDEO_PREVIEW', sel: SEL.VIDEO_PREVIEW, feature: 'Overlay button reparent target',       where: 'any', optional: true },
+		],
+
+		// Probe everything once. `force` (the console entry point) bypasses both
+		// the per-session throttle and the optional/relevance gating, so you get
+		// a full snapshot regardless of page or prior warnings.
+		check(force = false) {
+			const onWatch = Page.isWatchPage();
+			const results = [];
+			for (const p of this._probes) {
+				const relevant = p.where === 'any' || (p.where === 'watch' && onWatch);
+				const found = !!document.querySelector(p.sel);
+				results.push({ ...p, found, relevant });
+
+				if (force) continue; // console path reports via the return value below
+
+				if (p.optional) continue;        // optional selectors aren't auto-warned
+				if (!relevant) continue;          // wrong page type, a miss is expected
+				if (found) { this._warned.delete(p.key); continue; } // recovered, allow future warnings
+				if (this._warned.has(p.key)) continue;               // already warned this session
+
+				this._warned.add(p.key);
+				warn(`Selector health: "${p.sel}" (${p.key}) matched nothing on a page where it is expected. ` +
+					`Feature likely broken: ${p.feature}. YouTube may have renamed this element.`);
+			}
+
+			if (force) {
+				// Pretty console table for manual inspection. Returns the raw
+				// rows too so it's usable programmatically.
+				const rows = results.map(r => ({
+					key: r.key,
+					feature: r.feature,
+					where: r.where + (r.optional ? ' (optional)' : ''),
+					relevantNow: r.relevant,
+					found: r.found,
+				}));
+				try { console.table(rows); } catch { /* console.table absent in some engines */ }
+				return rows;
+			}
+			return results;
+		},
+
+		// Auto-run hook: fired from onUrlChange after a settle delay so YouTube
+		// has rendered the new page before we probe it.
+		scheduleCheck() {
+			clearTimeout(this._timer);
+			this._timer = setTimeout(() => this.check(false), URL_CHANGE_SETTLE_MS + 800);
+		},
+	};
+
 	// ── Boot ──────────────────────────────────────────────────────────────────
 
 	function tryInit() {
@@ -4429,6 +4335,7 @@
 		KeyboardShortcuts.init();
 		if (Page.isWatchPage()) TheaterMode.init();
 		if (Settings.get().enqueueFromPhone) PhonePoller.start();
+		SelectorHealth.scheduleCheck();
 
 		// Recover playback state after a page refresh.
 		//
@@ -4505,9 +4412,16 @@
 	//     The userscript @version string, surfaced for sanity-checking which
 	//     build is actually running on a page.
 	//
+	//   window.ytQueueManager.checkSelectors()
+	//     Probe every YouTube selector the script depends on and print a table
+	//     of which ones currently resolve. Use this when a feature stops working
+	//     to see at a glance which element YouTube has renamed. Returns the rows
+	//     as an array as well. Ignores the once-per-session warning throttle.
+	//
 	window.ytQueueManager = {
 		version: VERSION,
 		reloadAndResume: (url) => Player.reloadAndResume(url),
+		checkSelectors: () => SelectorHealth.check(true),
 		setDebug: (on) => {
 			DEBUG = !!on;
 			if (DEBUG) localStorage.setItem(DEBUG_KEY, '1');
