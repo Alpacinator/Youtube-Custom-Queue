@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name YouTube Queue Manager
 // @namespace https://github.com/Alpacinator/Youtube-Custom-Queue/
-// @version 2.4.1
+// @version 2.4.2
 // @description A persistent, cross-tab YouTube queue manager with drag-to-reorder, auto-advance, and optional auto theater mode.
 // @match *://*.youtube.com/*
 // @grant none
@@ -3180,8 +3180,8 @@
 			return `
         .ytqm-toggle { position: relative; flex-shrink: 0; width: 36px; height: 20px; cursor: pointer; }
         .ytqm-toggle input { opacity: 0; width: 0; height: 0; position: absolute; }
-        .ytqm-toggle-track { position: absolute; inset: 0; background: rgba(255,255,255,0.15); border-radius: 999px; border: 1px solid rgba(255,255,255,0.2); transition: background 0.2s, border-color 0.2s; }
-        .ytqm-toggle input:checked + .ytqm-toggle-track { background: rgba(204,0,0,0.85); border-color: rgba(204,0,0,0.6); }
+        .ytqm-toggle-track { position: absolute; inset: 0; background: rgba(255,255,255,0.15); border-radius: 999px; border: 1px solid rgba(255,255,255,0.75); transition: background 0.2s, border-color 0.2s; }
+        .ytqm-toggle input:checked + .ytqm-toggle-track { background: rgba(204,0,0,0.85); border-color: rgba(255,255,255,0.75); }
         .ytqm-toggle-thumb { position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; background: #fff; border-radius: 50%; box-shadow: 0 1px 4px rgba(0,0,0,0.4); transition: transform 0.2s; pointer-events: none; }
         .ytqm-toggle input:checked ~ .ytqm-toggle-thumb { transform: translateX(16px); }
       `;
