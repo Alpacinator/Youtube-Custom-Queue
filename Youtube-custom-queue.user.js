@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name YouTube Queue Manager
 // @namespace https://github.com/Alpacinator/Youtube-Custom-Queue/
-// @version 2.5.1
+// @version 2.6.0
 // @description A persistent, cross-tab YouTube queue manager with drag-to-reorder, auto-advance, and optional auto theater mode.
 // @match *://*.youtube.com/*
 // @grant none
@@ -107,6 +107,7 @@
 
 	const SETTINGS_DEFAULTS = {
 		remoteControls: true,
+		miniControls: true,
 		theaterMode: false,
 		blockContextMenu: true,
 		mediaSessionRefresh: true,
@@ -1367,6 +1368,22 @@
 				if (!this._playing || video.ended || Storage.paused) return;
 				if (Date.now() - (video._ytqmAttachedAt || 0) < 3000) {
 					log('Ignoring early pause event');
+					return;
+				}
+				// Skipping/scrubbing (arrow keys, seek bar, YouTube's own
+				// shortcuts) right to the end of a video often stops playback
+				// a fraction of a second short of the true duration, so
+				// video.ended never flips to true even though there is
+				// nothing left to watch. Left uncaught, that pause gets
+				// misread as a manual pause below and the queue stalls.
+				// Treat "paused within VIDEO_END_THRESHOLD_S of the end" as
+				// end-of-video so the queue still advances.
+				if (!isNaN(video.duration) && (video.duration - video.currentTime) <= VIDEO_END_THRESHOLD_S) {
+					log('Paused near end of video (skip/seek), treating as ended, advancing queue');
+					this._userPaused = false;
+					Storage.setPaused(false);
+					UI.showStatus('Advancing queue...');
+					this.advance();
 					return;
 				}
 				this._userPaused = true;
@@ -2785,6 +2802,10 @@
 		skipBtn: null,
 		prevBtn: null,
 		queueToggleBtn: null,
+		miniControls: null,
+		miniPrevBtn: null,
+		miniPlayPauseBtn: null,
+		miniNextBtn: null,
 		panel: null,
 		list: null,
 		nowPlayingSection: null,
@@ -2858,6 +2879,14 @@
         #ytqm-play-btn.is-playing { background: #c0392b; }
         #ytqm-play-btn.is-remote  { background: #1a6fa8; border-color: rgba(100,180,255,0.7); }
         #ytqm-root .ytqm-btn { flex: 1; }
+        #ytqm-mini-controls { display: none; align-items: center; gap: 4px; background: rgba(20,20,20,0.85); border: 1.5px solid rgba(255,255,255,0.75); border-radius: 999px; padding: 4px; box-shadow: 0 4px 18px rgba(0,0,0,0.55); }
+        #ytqm-mini-controls.visible { display: inline-flex; }
+        .ytqm-mini-btn { background: none; border: none; color: #fff; cursor: pointer; font-size: 15px; line-height: 1; width: 30px; height: 30px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; padding: 0; font-family: inherit; transition: background 0.15s, transform 0.12s ease; }
+        .ytqm-mini-btn:hover { background: rgba(255,255,255,0.15); transform: scale(1.06); }
+        .ytqm-mini-btn:active { transform: scale(1); }
+        .ytqm-mini-btn:disabled { opacity: 0.35; cursor: default; }
+        .ytqm-mini-btn:disabled:hover { background: none; transform: none; }
+        #ytqm-mini-playpause-btn.is-paused { color: #2ecc71; }
       `;
 		},
 
@@ -3040,6 +3069,52 @@
 			this.root.appendChild(this.queueToggleBtn);
 			this.root.appendChild(this.playBtn);
 			this.root.appendChild(this.addBtn);
+			this._buildMiniControls();
+			this.root.appendChild(this.miniControls);
+		},
+
+		// Small previous/pause/next cluster that sits to the right of the
+		// add/remove-from-queue button. Unlike the panel header's remote
+		// controls (which only exist while the panel is open), this stays
+		// visible at all times so playback can be driven from any tab
+		// without opening the panel. Hidden entirely when nothing is
+		// playing anywhere, or when the "Floating mini controls" setting
+		// is off (see updateRemotePauseBtn, which owns visibility).
+		_buildMiniControls() {
+			this.miniControls = document.createElement('div');
+			this.miniControls.id = 'ytqm-mini-controls';
+
+			this.miniPrevBtn = document.createElement('button');
+			this.miniPrevBtn.id = 'ytqm-mini-prev-btn';
+			this.miniPrevBtn.className = 'ytqm-mini-btn';
+			this.miniPrevBtn.title = 'Previous';
+			this.miniPrevBtn.textContent = '\u23ee';
+			this.miniPrevBtn.addEventListener('click', e => {
+				e.stopPropagation();
+				Player.remotePrev();
+			});
+
+			this.miniPlayPauseBtn = document.createElement('button');
+			this.miniPlayPauseBtn.id = 'ytqm-mini-playpause-btn';
+			this.miniPlayPauseBtn.className = 'ytqm-mini-btn';
+			this.miniPlayPauseBtn.title = 'Pause';
+			this.miniPlayPauseBtn.textContent = '\u23f8';
+			this.miniPlayPauseBtn.addEventListener('click', e => {
+				e.stopPropagation();
+				this._onRemotePauseClick();
+			});
+
+			this.miniNextBtn = document.createElement('button');
+			this.miniNextBtn.id = 'ytqm-mini-next-btn';
+			this.miniNextBtn.className = 'ytqm-mini-btn';
+			this.miniNextBtn.title = 'Next';
+			this.miniNextBtn.textContent = '\u23ed';
+			this.miniNextBtn.addEventListener('click', e => {
+				e.stopPropagation();
+				Player.remoteSkip();
+			});
+
+			this.miniControls.append(this.miniPrevBtn, this.miniPlayPauseBtn, this.miniNextBtn);
 		},
 
 		_makeBtn(id, label, onClick) {
@@ -3267,6 +3342,11 @@
 					key: 'remoteControls',
 					label: 'Cross-tab controls',
 					sub: 'Show pause, skip & previous buttons in the queue panel when another tab is playing.'
+				},
+				{
+					key: 'miniControls',
+					label: 'Floating mini controls',
+					sub: 'Show a small previous / pause / next cluster next to the queue button, so playback can be controlled from any tab without opening the panel.'
 				},
 				{
 					key: 'theaterMode',
@@ -3742,10 +3822,10 @@
 			if (!this.remotePauseBtn) return;
 			const anyPlaying = Player._playing || PlayingTab.anyPlaying();
 			const remoteControls = Settings.get().remoteControls;
+			const isPaused = Storage.paused;
+			const hasHistory = Storage.history.length > 0;
+			const hasNext = Storage.queue.length > 1;
 			if (anyPlaying && remoteControls) {
-				const isPaused = Storage.paused;
-				const hasHistory = Storage.history.length > 0;
-				const hasNext = Storage.queue.length > 1;
 				this.remotePauseBtn.style.display = 'inline-block';
 				this.remotePauseBtn.textContent = isPaused ? '\u25b6 Resume' : '\u23f8 Pause';
 				isPaused ? this.remotePauseBtn.classList.add('is-paused') : this.remotePauseBtn.classList.remove('is-paused');
@@ -3756,6 +3836,23 @@
 				if (this.prevBtn) this.prevBtn.style.display = 'none';
 				if (this.skipBtn) this.skipBtn.style.display = 'none';
 			}
+			this._updateMiniControls(anyPlaying, isPaused, hasHistory, hasNext);
+		},
+
+		// Mirrors the panel header's remote controls (above), but for the
+		// always-visible cluster next to the queue button. Kept as its own
+		// method, gated by its own "miniControls" setting, so the two can be
+		// toggled independently.
+		_updateMiniControls(anyPlaying, isPaused, hasHistory, hasNext) {
+			if (!this.miniControls) return;
+			const enabled = Settings.get().miniControls;
+			this.miniControls.classList.toggle('visible', !!(anyPlaying && enabled));
+			if (!anyPlaying || !enabled) return;
+			this.miniPlayPauseBtn.textContent = isPaused ? '\u25b6' : '\u23f8';
+			this.miniPlayPauseBtn.title = isPaused ? 'Resume' : 'Pause';
+			this.miniPlayPauseBtn.classList.toggle('is-paused', isPaused);
+			this.miniPrevBtn.disabled = !hasHistory;
+			this.miniNextBtn.disabled = !hasNext;
 		},
 
 		togglePanel(force) {
