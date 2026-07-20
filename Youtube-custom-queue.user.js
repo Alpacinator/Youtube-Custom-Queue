@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name YouTube Queue Manager
 // @namespace https://github.com/Alpacinator/Youtube-Custom-Queue/
-// @version 2.6.0
+// @version 2.6.1
 // @description A persistent, cross-tab YouTube queue manager with drag-to-reorder, auto-advance, and optional auto theater mode.
 // @match *://*.youtube.com/*
 // @grant none
@@ -61,7 +61,7 @@
 	// metadata at the top of this file; both must be bumped together. The
 	// public API exposes this as window.ytQueueManager.version, and the boot
 	// banner prints it so users can verify which build is actually running.
-	const VERSION = '2.5.1';
+	const VERSION = '2.6.1';
 
 	const STORAGE_KEY = 'yt_queue_manager_v1';
 	const PLAYING_KEY = 'yt_queue_playing_tab';
@@ -74,6 +74,7 @@
 	const HEARTBEAT_INTERVAL_MS = 3000;
 	const HEARTBEAT_TTL_MS = 10000;
 	const VIDEO_END_THRESHOLD_S = 2;
+	const RESTART_FROM_BEGINNING_SKIP_THRESHOLD_S = 3; // if already within this many seconds of 0, don't bother seeking
 	const HISTORY_MAX = 50; // bumped from 10, the JSON cost is trivial and 10 is too small in practice
 	const NAV_TIMEOUT_MS = 30000;
 	const NAV_HREF_RESTORE_MS = 2000; // how long after click() before we restore the hijacked anchor's original href
@@ -901,7 +902,8 @@
 
 		start() {
 			this._playing = true;
-			this._advancing = false; // fresh session, clear any stale guard
+			this._advancing = false; // fresh session, clear any stale guards
+			this._navigatingToPrev = false;
 			PlayingTab.claim();
 			Storage.setPaused(false);
 			Storage.setPlaying(true);
@@ -1047,6 +1049,49 @@
 			}
 		},
 
+		/**
+		 * True while YouTube is playing an ad. Ads run through the SAME <video>
+		 * element as the content, so the element fires `ended` when the ad
+		 * finishes and `duration` reports the ad's length while it runs. Without
+		 * this check, every pre-roll and mid-roll advanced the queue.
+		 * YouTube marks the player element with `ad-showing` / `ad-interrupting`
+		 * for the whole ad break; the overlay probe is a fallback for layouts
+		 * that drop the classes.
+		 */
+		_isAdPlaying() {
+			const p = document.querySelector(SEL.PLAYER);
+			if (p && (p.classList.contains('ad-showing') || p.classList.contains('ad-interrupting'))) return true;
+			return !!document.querySelector('.video-ads .ytp-ad-player-overlay, .ytp-ad-module .ytp-ad-player-overlay-layout');
+		},
+
+		/**
+		 * True when the player is actually showing the queue head. Guards against
+		 * end signals arriving from a stale/reused element after the URL has
+		 * already moved on.
+		 */
+		_isCurrentQueueVideo() {
+			const head = Storage.peekFirst();
+			const expected = head ? getVideoId(head.url) : null;
+			if (!expected) return true;
+			if (getVideoId(location.href) !== expected) return false;
+			const p = document.querySelector('#movie_player');
+			const id = (typeof p?.getVideoData === 'function') ? p.getVideoData()?.video_id : null;
+			return !id || id === expected;
+		},
+
+		/** Single gate for every "the video ended, advance" code path. */
+		_shouldAdvanceOnEnd() {
+			if (this._isAdPlaying()) {
+				log('End signal received during an ad, ignoring');
+				return false;
+			}
+			if (!this._isCurrentQueueVideo()) {
+				log('End signal for a video that is not the queue head, ignoring');
+				return false;
+			}
+			return true;
+		},
+
 		_scheduleEndPoll(video) {
 			this._clearEndPoll();
 			if (!this._playing || !video) return;
@@ -1063,6 +1108,10 @@
 				// the browser even on paths that drop the ended event, so the safety-net
 				// goal is preserved with a worst-case lag of one poll tick (~1 s).
 				if (video.ended) {
+					if (!this._shouldAdvanceOnEnd()) {
+						this._endPollTimer = setTimeout(check, 1000);
+						return;
+					}
 					log('End poll: video.ended, advancing queue');
 					this._userPaused = false;
 					Storage.setPaused(false);
@@ -1230,9 +1279,13 @@
 		 */
 		_skipUnplayable() {
 			if (!this._playing) return;
-			// This is a resolution of a navigation attempt, clear the advance guard
-			// so the queue isn't stuck if the failed video never attached.
+			// This resolves a navigation attempt (forward OR backward - an
+			// unavailable "previous" video falls through here too), so clear
+			// both in-flight flags. Leaving either one stuck true would keep
+			// _navInFlight() true forever and silently block every future
+			// skip/previous press.
 			this._advancing = false;
+			this._navigatingToPrev = false;
 			Storage.shiftQueue(); // drop the failed entry without writing history
 			this._attachedVideoId = null;
 			this._detachVideoListeners();
@@ -1319,27 +1372,55 @@
 				else video.currentTime = 0; // last-resort fallback
 			};
 
+			const readTime = () => (canApi && typeof player.getCurrentTime === 'function')
+				? player.getCurrentTime()
+				: video.currentTime;
+
+			// If the video is already within the first few seconds, there's
+			// nothing meaningful to restart. Skip the seek/reassert dance
+			// entirely and just let it play, rather than fighting YouTube's
+			// own init seek for a video that's already effectively at the
+			// start.
+			const startT = readTime();
+			if (!isNaN(startT) && startT <= RESTART_FROM_BEGINNING_SKIP_THRESHOLD_S) {
+				log('Restart-from-beginning: already at', startT, 's (<=', RESTART_FROM_BEGINNING_SKIP_THRESHOLD_S, 's), leaving position as-is');
+				whenReady(play);
+				return;
+			}
+
 			whenReady(() => {
 				seekToStart();
 				play();
+
 				let attempts = 0;
 				const MAX_ATTEMPTS = 6;      // ~1.2s at 200ms spacing
 				const REASSERT_MS = 200;
-				const SETTLED_S = 1.5;       // if we're already past this, assume
-				                             // YouTube isn't going to resume-seek
+				const JUMP_TOLERANCE_S = 1.0; // slack for timer jitter and decode lag
+
+				let lastT = readTime();
+				let lastWall = Date.now();
+
+				// Only undo DISCONTINUOUS forward jumps. Normal playback advances
+				// currentTime at ~1x wall clock, so a delta meaningfully larger than
+				// the elapsed real time is YouTube's resume seek and gets pulled back.
+				// The previous version compared currentTime against a fixed 1.5s
+				// threshold, which meant a single late tick during ordinary playback
+				// from 0 looked identical to a resume seek and bounced the video back
+				// to the start about a second in.
 				const reassert = () => {
 					if (!this._playing || video.ended) return;
 					if (++attempts > MAX_ATTEMPTS) return;
-					const t = canApi && typeof player.getCurrentTime === 'function'
-						? player.getCurrentTime()
-						: video.currentTime;
-					// If something pushed us into the video (YouTube's resume seek),
-					// pull it back to 0. Once playback is comfortably past the start
-					// without having been yanked forward, stop, the user may be
-					// scrubbing intentionally.
-					if (!isNaN(t) && t > SETTLED_S) {
+					const t = readTime();
+					const wall = Date.now();
+					const elapsed = (wall - lastWall) / 1000;
+					if (!isNaN(t) && (t - lastT) > elapsed + JUMP_TOLERANCE_S) {
+						log('Resume-seek detected (', lastT, '->', t, '), pulling back to 0');
 						seekToStart();
+						lastT = 0;
+					} else {
+						lastT = t;
 					}
+					lastWall = wall;
 					setTimeout(reassert, REASSERT_MS);
 				};
 				setTimeout(reassert, REASSERT_MS);
@@ -1366,6 +1447,12 @@
 
 			video.addEventListener('pause', () => {
 				if (!this._playing || video.ended || Storage.paused) return;
+				// Ad breaks pause the content video. Recording that as a manual
+				// pause left _userPaused stuck true and stalled the queue.
+				if (this._isAdPlaying()) {
+					log('Pause during ad, ignoring');
+					return;
+				}
 				if (Date.now() - (video._ytqmAttachedAt || 0) < 3000) {
 					log('Ignoring early pause event');
 					return;
@@ -1378,7 +1465,9 @@
 				// misread as a manual pause below and the queue stalls.
 				// Treat "paused within VIDEO_END_THRESHOLD_S of the end" as
 				// end-of-video so the queue still advances.
-				if (!isNaN(video.duration) && (video.duration - video.currentTime) <= VIDEO_END_THRESHOLD_S) {
+				if (!isNaN(video.duration)
+					&& (video.duration - video.currentTime) <= VIDEO_END_THRESHOLD_S
+					&& this._shouldAdvanceOnEnd()) {
 					log('Paused near end of video (skip/seek), treating as ended, advancing queue');
 					this._userPaused = false;
 					Storage.setPaused(false);
@@ -1389,6 +1478,15 @@
 				this._userPaused = true;
 				log('Video paused by user');
 				UI.showStatus('Paused', 99999);
+				// Sync the shared paused flag and our own button so a pause made
+				// via YouTube's own controls (spacebar, click-to-pause, etc.)
+				// is reflected the same way a pause via our controls would be.
+				// Storage.setPaused is a no-op past its own dedupe if remotePause()
+				// already set this, and writes here don't loop back through
+				// _onPauseStorageChange since same-tab storage writes don't fire
+				// the 'storage' event.
+				if (!Storage.paused) Storage.setPaused(true);
+				UI.updateRemotePauseBtn();
 			}, {
 				signal
 			});
@@ -1404,12 +1502,18 @@
 				}
 				UI.showStatus('Playing', 2000);
 				if (this._playing && !this._endPollTimer) this._scheduleEndPoll(video);
+				// Mirror the pause-side sync: playback resumed via YouTube's own
+				// controls should clear the shared paused flag and update our
+				// button too, not just a resume triggered from our controls.
+				if (Storage.paused) Storage.setPaused(false);
+				UI.updateRemotePauseBtn();
 			}, {
 				signal
 			});
 
 			video.addEventListener('ended', () => {
 				if (!this._playing) return;
+				if (!this._shouldAdvanceOnEnd()) return;
 				log('ended event: advancing queue');
 				this._userPaused = false;
 				Storage.setPaused(false);
@@ -1442,9 +1546,13 @@
 			video.addEventListener('timeupdate', () => {
 				if (!this._playing || Storage.paused) return;
 				if (isNaN(video.duration)) return;
+				// During an ad, video.duration is the AD's duration, so the
+				// remaining-time shortcut below measures the wrong clip entirely.
+				if (this._isAdPlaying()) return;
 				const remaining = video.duration - video.currentTime;
 				if (remaining > 5) return;
 				if (video.ended) {
+					if (!this._shouldAdvanceOnEnd()) return;
 					log('timeupdate: video.ended, advancing');
 					this._userPaused = false;
 					Storage.setPaused(false);
@@ -1455,16 +1563,35 @@
 			});
 		},
 
+		// True while ANY queue navigation (forward via advance()/skip, or
+		// backward via previous()) is in flight. Both directions share this
+		// check - previously advance() only looked at _advancing and
+		// previous() only looked at _navigatingToPrev, so a skip could
+		// interrupt an in-flight previous() (and vice versa) by kicking off
+		// a second Navigator.goTo before the first one's navigation had
+		// resolved. YouTube's SPA nav can only really have one navigation
+		// in flight at a time; overlapping ones raced, and whichever one
+		// lost meant nothing ever called _onVideoReady/_skipUnplayable for
+		// it - leaving its guard flag stuck true forever and silently
+		// swallowing every later skip/previous press ("navigation already
+		// in flight, ignoring duplicate call", forever). Rapid alternating
+		// previous/next/previous/next was the easiest way to hit this,
+		// since each direction only ever checked its own flag.
+		_navInFlight() {
+			return this._advancing || this._navigatingToPrev;
+		},
+
 		advance() {
 			// Reentrancy guard. The three end-detection paths (timeupdate, the ended
 			// event, and the end-poll timer) plus the manual skip controls can each
 			// call advance() in separate tasks. Because _playing stays true and the
 			// next video's listeners don't attach until navigation settles, two calls
 			// in that window would each shiftQueue and skip a video the user never saw.
+			// Also bails if a previous() is still in flight, see _navInFlight().
 			// The guard is released in _onVideoReady (next video attached), in
 			// _skipUnplayable (failed-load path), and in stop(). Fast skip presses
 			// therefore advance one item at a time.
-			if (this._advancing) {
+			if (this._navInFlight()) {
 				log('advance(): navigation already in flight, ignoring duplicate call');
 				return;
 			}
@@ -1587,7 +1714,7 @@
 
 		previous() {
 			if (!this._playing) return;
-			if (this._navigatingToPrev) {
+			if (this._navInFlight()) {
 				log('previous(): navigation already in flight, ignoring');
 				return;
 			}
@@ -2817,10 +2944,109 @@
 		addBtnFlash: null,
 		addBtnLabel: null,
 		_addBtnFlashTimer: null,
+		_dockObserver: null,
+		_dockRetryTimer: null,
 
 		_applyPanelBlur() {
 			if (!this.panel) return;
 			this.panel.classList.toggle('ytqm-panel-blur', !!Settings.get().panelBlur);
+		},
+
+		// ── Docked-menu placement ────────────────────────────────────────────
+		//
+		// The button bar (#ytqm-root, living inside the shadow host) normally
+		// floats over the bottom-left corner via `position: fixed` on the host
+		// element itself. When the "Full-width docked menu" setting is on, we
+		// instead reparent the host into YouTube's own #full-bleed-container
+		// (a watch-page-only element that wraps the player) and switch it to a
+		// static, full-width strip.
+		//
+		// #full-bleed-container doesn't exist on non-watch pages, and on watch
+		// pages it can be torn down and rebuilt across SPA navigations - and,
+		// it turns out, well after the initial page load too. YouTube keeps
+		// reflowing the area around the player as ads, related videos, and
+		// comments settle in, and that can rebuild the wrapper around #player
+		// (or wipe/replace its children outright), silently detaching or
+		// stranding our host node even though it was correctly docked a
+		// moment earlier. So this isn't a one-shot reparent: alongside the
+		// re-evaluation on settings toggle / init / onUrlChange, we keep a
+		// standing MutationObserver for as long as docked mode is active that
+		// re-verifies placement on every relevant mutation and re-docks if
+		// something knocked it loose.
+		_applyDockMode() {
+			if (!this.host) return;
+			clearTimeout(this._dockRetryTimer);
+			if (this._dockObserver) {
+				this._dockObserver.disconnect();
+				this._dockObserver = null;
+			}
+
+			if (!Settings.get().dockedControls) {
+				this._undock();
+				return;
+			}
+
+			const target = document.getElementById('player');
+			if (target) this._dockInto(target);
+			else this._undock(); // Container isn't present yet, float until it shows up.
+
+			// Standing watch: re-checked on every mutation for as long as
+			// docked mode stays on, not just until the first successful dock.
+			this._dockObserver = new MutationObserver(() => {
+				if (!Settings.get().dockedControls) {
+					this._dockObserver?.disconnect();
+					this._dockObserver = null;
+					return;
+				}
+				const t = document.getElementById('player');
+				if (!t) {
+					this._undock();
+					return;
+				}
+				// Re-dock only if placement actually broke (detached entirely,
+				// or no longer the element immediately after #player) - _dockInto
+				// itself is idempotent, but skipping the call when nothing's
+				// wrong avoids needless style/DOM churn on every unrelated
+				// mutation elsewhere on the page.
+				const stillDocked = this.host.isConnected
+					&& this.host.previousElementSibling === t
+					&& this.host.parentElement === t.parentElement;
+				if (!stillDocked) this._dockInto(t);
+			});
+			this._dockObserver.observe(document.body, { childList: true, subtree: true });
+		},
+
+		_dockInto(target) {
+			// Insert the host immediately after #player (between player and #below),
+			// not inside the player container itself.
+			const shouldInsert = this.host.previousElementSibling !== target
+				|| this.host.parentElement !== target.parentElement;
+			if (shouldInsert) target.insertAdjacentElement('afterend', this.host);
+			Object.assign(this.host.style, {
+				position: 'relative',
+				bottom: 'auto',
+				left: 'auto',
+				width: '100%',
+				height: 'auto',
+				zIndex: '1',
+				pointerEvents: 'all',
+			});
+			this.root?.classList.add('ytqm-docked');
+			log('UI: docked button bar after #player');
+		},
+
+		_undock() {
+			if (this.host.parentElement !== document.body) document.body.appendChild(this.host);
+			Object.assign(this.host.style, {
+				position: 'fixed',
+				bottom: '0',
+				left: '0',
+				width: '0',
+				height: '0',
+				zIndex: '9999',
+				pointerEvents: 'none',
+			});
+			this.root?.classList.remove('ytqm-docked');
 		},
 
 		init() {
@@ -2849,6 +3075,7 @@
 			this._applyPanelBlur();
 			this._buildButtons();
 			document.body.appendChild(this.host);
+			this._applyDockMode();
 
 			document.addEventListener('mousedown', e => {
 				if (!this.panelOpen) return;
@@ -2871,6 +3098,18 @@
 		_cssButtonBar() {
 			return `
         #ytqm-root { position: fixed; bottom: 24px; left: 20px; display: flex; flex-direction: row; align-items: center; gap: 8px; pointer-events: all; z-index: 2; }
+        #ytqm-root.ytqm-docked {
+            position: static;
+            bottom: auto;
+            left: auto;
+            width: 100%;
+            justify-content: center;
+            flex-wrap: wrap;
+            padding: 10px 16px;
+            background: rgba(20,20,20,0.92);
+            border-top: 1px solid rgba(255,255,255,0.12);
+            box-shadow: none;
+        }
         .ytqm-btn { display: inline-flex; align-items: center; gap: 6px; padding: 9px 15px; border-radius: 999px; border: 1.5px solid rgba(255,255,255,0.75); cursor: pointer; font-size: 13px; font-weight: 600; font-family: 'Segoe UI', Arial, system-ui, sans-serif; letter-spacing: 0.02em; transition: transform 0.12s ease, opacity 0.12s ease, background 0.2s ease; user-select: none; white-space: nowrap; box-shadow: 0 4px 18px rgba(0,0,0,0.55); outline: none; line-height: 1; }
         .ytqm-btn:hover  { transform: scale(1.04); }
         .ytqm-btn:active { transform: scale(1); }
@@ -2878,8 +3117,7 @@
         #ytqm-add-btn { position: relative; }
         #ytqm-play-btn.is-playing { background: #c0392b; }
         #ytqm-play-btn.is-remote  { background: #1a6fa8; border-color: rgba(100,180,255,0.7); }
-        #ytqm-root .ytqm-btn { flex: 1; }
-        #ytqm-mini-controls { display: none; align-items: center; gap: 4px; background: rgba(20,20,20,0.85); border: 1.5px solid rgba(255,255,255,0.75); border-radius: 999px; padding: 4px; box-shadow: 0 4px 18px rgba(0,0,0,0.55); }
+        #ytqm-mini-controls { display: none; align-items: center; gap: 4px; background: rgba(20,20,20,0.9); border: 1.5px solid rgba(255,255,255,0.9); border-radius: 999px; padding: 4px; box-shadow: 0 4px 18px rgba(0,0,0,0.55); }
         #ytqm-mini-controls.visible { display: inline-flex; }
         .ytqm-mini-btn { background: none; border: none; color: #fff; cursor: pointer; font-size: 15px; line-height: 1; width: 30px; height: 30px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; padding: 0; font-family: inherit; transition: background 0.15s, transform 0.12s ease; }
         .ytqm-mini-btn:hover { background: rgba(255,255,255,0.15); transform: scale(1.06); }
@@ -2887,6 +3125,40 @@
         .ytqm-mini-btn:disabled { opacity: 0.35; cursor: default; }
         .ytqm-mini-btn:disabled:hover { background: none; transform: none; }
         #ytqm-mini-playpause-btn.is-paused { color: #2ecc71; }
+
+        /* ── Docked mode ──────────────────────────────────────────────
+           The pill/shadow/thick-border treatment above is built for
+           floating over arbitrary video content, where it needs to
+           stand on its own. Docked mode already sits on its own flat,
+           bordered strip under the player, so that same treatment reads
+           as too heavy/loud. Flatten it into a plain toolbar look that
+           belongs to the strip instead of fighting it. */
+        #ytqm-root.ytqm-docked .ytqm-btn {
+            flex: 0 0 150px;
+            justify-content: center;
+            padding: 7px 14px;
+            border-radius: 8px;
+            border: 1px solid rgba(255,255,255,0.16);
+            box-shadow: none;
+            font-weight: 500;
+            letter-spacing: 0.01em;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        #ytqm-root.ytqm-docked .ytqm-btn:hover { transform: none; background: rgba(255,255,255,0.1); }
+        #ytqm-root.ytqm-docked .ytqm-btn:active { background: rgba(255,255,255,0.14); }
+        #ytqm-root.ytqm-docked #ytqm-add-btn,
+        #ytqm-root.ytqm-docked #ytqm-queue-toggle,
+        #ytqm-root.ytqm-docked #ytqm-play-btn { background: rgba(255,255,255,0.05); }
+        #ytqm-root.ytqm-docked #ytqm-play-btn.is-playing { background: rgba(192,57,43,0.9); border-color: rgba(192,57,43,0.9); }
+        #ytqm-root.ytqm-docked #ytqm-play-btn.is-remote  { background: rgba(26,111,168,0.9); border-color: rgba(100,180,255,0.5); }
+        #ytqm-root.ytqm-docked #ytqm-add-btn-flash { border-radius: 8px; }
+        #ytqm-root.ytqm-docked #ytqm-mini-controls {
+            background: rgba(255,255,255,0.05);
+            border: none;
+            box-shadow: none;
+            border-radius: 8px;
+        }
       `;
 		},
 
@@ -2993,12 +3265,20 @@
         #ytqm-settings-overlay.open { display: flex; }
         #ytqm-settings-modal { background: #111; border: 1.5px solid rgba(255,255,255,0.18); border-radius: 16px; box-shadow: 0 8px 40px rgba(0,0,0,0.75); width: min(780px, 96vw); max-height: 85vh; color: #fff; font-family: 'Segoe UI', Arial, system-ui, sans-serif; overflow: hidden; display: flex; flex-direction: column; }
         #ytqm-settings-content { display: flex; flex: 1; min-height: 0; overflow: hidden; }
-        .ytqm-settings-category { padding: 8px 16px 2px; font-size: 9px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: rgba(255,255,255,0.22); margin-top: 6px; break-after: avoid; break-inside: avoid; }
-        .ytqm-category-wrap { break-inside: avoid; }
-        .ytqm-category-wrap[data-column-break] { break-before: column; }
         #ytqm-settings-header { padding: 14px 16px 10px; font-size: 13px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: rgba(255,255,255,0.5); border-bottom: 1px solid rgba(255,255,255,0.08); display: flex; align-items: center; justify-content: space-between; }
-        #ytqm-settings-body { flex: 1; padding: 10px 0 6px; overflow-y: auto; columns: 2; column-gap: 0; min-height: 0; }
-        .ytqm-setting-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 16px; border-radius: 8px; margin: 2px 6px; transition: background 0.12s; cursor: default; break-inside: avoid; }
+
+        /* ── Tab sidebar ── */
+        #ytqm-settings-sidebar { width: 130px; flex-shrink: 0; border-right: 1px solid rgba(255,255,255,0.08); padding: 8px 0; display: flex; flex-direction: column; gap: 1px; overflow-y: auto; }
+        .ytqm-tab-btn { background: none; border: none; border-right: 2px solid transparent; color: rgba(255,255,255,0.4); font-family: inherit; font-size: 12px; font-weight: 600; letter-spacing: 0.03em; text-align: left; padding: 10px 14px; cursor: pointer; transition: background 0.12s, color 0.12s, border-color 0.12s; width: 100%; }
+        .ytqm-tab-btn:hover { background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.8); }
+        .ytqm-tab-btn.active { background: rgba(255,255,255,0.09); color: #fff; border-right-color: rgba(255,255,255,0.7); }
+
+        /* ── Tab panels ── */
+        #ytqm-settings-body { flex: 1; overflow-y: auto; min-height: 0; padding: 4px 0 8px; }
+        .ytqm-tab-panel { display: none; }
+        .ytqm-tab-panel.active { display: block; }
+
+        .ytqm-setting-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 16px; border-radius: 8px; margin: 2px 6px; transition: background 0.12s; cursor: default; }
         .ytqm-setting-row:hover { background: rgba(255,255,255,0.05); }
         .ytqm-setting-label { font-size: 12.5px; color: rgba(255,255,255,0.8); line-height: 1.4; flex: 1; }
         .ytqm-setting-label small { display: block; font-size: 11px; color: rgba(255,255,255,0.35); margin-top: 2px; font-weight: 400; }
@@ -3011,7 +3291,7 @@
         #ytqm-phone-url-input:focus { outline: none; border-color: rgba(255,255,255,0.45); }
 
         /* ── Import / Export section ── */
-        #ytqm-io-section { width: 195px; flex-shrink: 0; border-left: 1px solid rgba(255,255,255,0.08); padding: 16px 14px; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; }
+        #ytqm-io-section { width: 180px; flex-shrink: 0; border-left: 1px solid rgba(255,255,255,0.08); padding: 14px 12px; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; }
         #ytqm-io-title { font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: rgba(255,255,255,0.3); margin-bottom: 10px; }
         .ytqm-io-row { display: flex; flex-direction: column; gap: 6px; margin-bottom: 0; }
         .ytqm-io-btn { width: 100%; background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.18); border-radius: 8px; color: rgba(255,255,255,0.8); font-size: 12px; font-weight: 600; font-family: inherit; padding: 7px 10px; cursor: pointer; transition: background 0.15s, color 0.15s; white-space: nowrap; text-align: center; }
@@ -3024,7 +3304,9 @@
         @media (max-width: 600px) {
             #ytqm-settings-modal { width: 95vw; max-height: 90vh; }
             #ytqm-settings-content { flex-direction: column; overflow-y: auto; }
-            #ytqm-settings-body { columns: 1; overflow: visible; }
+            #ytqm-settings-sidebar { width: auto; flex-direction: row; border-right: none; border-bottom: 1px solid rgba(255,255,255,0.08); padding: 4px 8px; overflow-x: auto; }
+            .ytqm-tab-btn { border-right: none; border-bottom: 2px solid transparent; padding: 8px 12px; white-space: nowrap; }
+            .ytqm-tab-btn.active { border-bottom-color: rgba(255,255,255,0.7); border-right-color: transparent; }
             #ytqm-io-section { width: auto; border-left: none; border-top: 1px solid rgba(255,255,255,0.08); }
         }
       `;
@@ -3286,12 +3568,23 @@
 			const body = document.createElement('div');
 			body.id = 'ytqm-settings-body';
 
+			// Build a sidebar + tab-panel layout from the defs array.
+			// Each { type: 'header' } entry becomes a tab button; its following
+			// entries are rendered into the corresponding panel.
+			const sidebar = document.createElement('div');
+			sidebar.id = 'ytqm-settings-sidebar';
+
 			const defs = [
 				{ type: 'header', label: 'Appearance' },
 				{
 					key: 'panelBlur',
 					label: 'Frosted glass panel',
 					sub: 'Blur and fade the queue panel background for a frosted glass look.'
+				},
+				{
+					key: 'dockedControls',
+					label: 'Full-width docked menu',
+					sub: 'Dock the button bar as a full-width strip under the video player instead of floating in the corner. Falls back to floating on non-watch pages.'
 				},
 				{
 					key: 'keyboardShortcuts',
@@ -3319,7 +3612,7 @@
 					label: 'Hide interruptions banner',
 					sub: 'Hide the "Experiencing interruptions?" notification bar that appears below the video.'
 				},
-				{ type: 'header', label: 'Phone', columnBreak: true },
+				{ type: 'header', label: 'Phone' },
 				{
 					key: 'enqueueFromPhone',
 					label: 'Enqueue videos shared from phone',
@@ -3360,133 +3653,159 @@
 				},
 			];
 
-			let phoneUrlRow = null;
-			let currentCategoryWrapper = null;
+			// Group defs into tabs: each { type: 'header' } starts a new tab.
+			const tabGroups = [];
+			let currentGroup = null;
 			defs.forEach(def => {
 				if (def.type === 'header') {
-					currentCategoryWrapper = document.createElement('div');
-					currentCategoryWrapper.className = 'ytqm-category-wrap';
-					if (def.columnBreak) currentCategoryWrapper.dataset.columnBreak = 'true';
-					const hdr = document.createElement('div');
-					hdr.className = 'ytqm-settings-category';
-					hdr.textContent = def.label;
-					currentCategoryWrapper.appendChild(hdr);
-					body.appendChild(currentCategoryWrapper);
-					return;
+					currentGroup = { label: def.label, items: [] };
+					tabGroups.push(currentGroup);
+				} else if (currentGroup) {
+					currentGroup.items.push(def);
 				}
-				if (def.type === 'phoneUrl') {
-					const urlRow = document.createElement('label');
-					urlRow.className = 'ytqm-setting-row url-row';
-					const urlLabel = document.createElement('span');
-					urlLabel.className = 'ytqm-setting-label';
-					urlLabel.textContent = 'Phone server URL';
-					const urlSmall = document.createElement('small');
-					urlSmall.textContent = `Address of the /poll endpoint on your local server. Default: ${SETTINGS_DEFAULTS.phoneServerUrl}`;
-					urlLabel.appendChild(urlSmall);
-					const urlInput = document.createElement('input');
-					urlInput.id = 'ytqm-phone-url-input';
-					urlInput.type = 'text';
-					urlInput.placeholder = SETTINGS_DEFAULTS.phoneServerUrl;
-					urlInput.value = Settings.get().phoneServerUrl || SETTINGS_DEFAULTS.phoneServerUrl;
-					const isValidUrl = (val) => {
-						try { const u = new URL(val); return u.protocol === 'http:' || u.protocol === 'https:'; } catch { return false; }
-					};
-					const reflectValidity = () => {
-						const v = urlInput.value.trim();
-						const ok = !v || isValidUrl(v);
-						urlInput.style.borderColor = ok ? '' : 'rgba(231,76,60,0.85)';
-						urlInput.title = ok ? '' : 'Must be an http:// or https:// URL';
-					};
-					urlInput.addEventListener('input', reflectValidity);
-					urlInput.addEventListener('change', () => {
-						const v = urlInput.value.trim();
-						if (v && !isValidUrl(v)) { reflectValidity(); warn('Rejected invalid phoneServerUrl:', v); return; }
-						Settings.set('phoneServerUrl', v || SETTINGS_DEFAULTS.phoneServerUrl);
-						log('Setting changed: phoneServerUrl =', Settings.get().phoneServerUrl);
+			});
+
+			let phoneUrlRow = null;
+			const tabPanels = [];
+			const tabBtns = [];
+
+			const activateTab = (index) => {
+				tabBtns.forEach((b, i) => b.classList.toggle('active', i === index));
+				tabPanels.forEach((p, i) => p.classList.toggle('active', i === index));
+			};
+
+			tabGroups.forEach((group, groupIdx) => {
+				// Tab button in sidebar
+				const tabBtn = document.createElement('button');
+				tabBtn.className = 'ytqm-tab-btn' + (groupIdx === 0 ? ' active' : '');
+				tabBtn.textContent = group.label;
+				tabBtn.addEventListener('click', () => activateTab(groupIdx));
+				sidebar.appendChild(tabBtn);
+				tabBtns.push(tabBtn);
+
+				// Tab content panel
+				const panel = document.createElement('div');
+				panel.className = 'ytqm-tab-panel' + (groupIdx === 0 ? ' active' : '');
+				body.appendChild(panel);
+				tabPanels.push(panel);
+
+				group.items.forEach(def => {
+					if (def.type === 'phoneUrl') {
+						const urlRow = document.createElement('label');
+						urlRow.className = 'ytqm-setting-row url-row';
+						const urlLabel = document.createElement('span');
+						urlLabel.className = 'ytqm-setting-label';
+						urlLabel.textContent = 'Phone server URL';
+						const urlSmall = document.createElement('small');
+						urlSmall.textContent = `Address of the /poll endpoint on your local server. Default: ${SETTINGS_DEFAULTS.phoneServerUrl}`;
+						urlLabel.appendChild(urlSmall);
+						const urlInput = document.createElement('input');
+						urlInput.id = 'ytqm-phone-url-input';
+						urlInput.type = 'text';
+						urlInput.placeholder = SETTINGS_DEFAULTS.phoneServerUrl;
+						urlInput.value = Settings.get().phoneServerUrl || SETTINGS_DEFAULTS.phoneServerUrl;
+						const isValidUrl = (val) => {
+							try { const u = new URL(val); return u.protocol === 'http:' || u.protocol === 'https:'; } catch { return false; }
+						};
+						const reflectValidity = () => {
+							const v = urlInput.value.trim();
+							const ok = !v || isValidUrl(v);
+							urlInput.style.borderColor = ok ? '' : 'rgba(231,76,60,0.85)';
+							urlInput.title = ok ? '' : 'Must be an http:// or https:// URL';
+						};
+						urlInput.addEventListener('input', reflectValidity);
+						urlInput.addEventListener('change', () => {
+							const v = urlInput.value.trim();
+							if (v && !isValidUrl(v)) { reflectValidity(); warn('Rejected invalid phoneServerUrl:', v); return; }
+							Settings.set('phoneServerUrl', v || SETTINGS_DEFAULTS.phoneServerUrl);
+							log('Setting changed: phoneServerUrl =', Settings.get().phoneServerUrl);
+							reflectValidity();
+						});
 						reflectValidity();
-					});
-					reflectValidity();
-					urlRow.append(urlLabel, urlInput);
-					phoneUrlRow = urlRow;
-					urlRow.style.display = Settings.get().enqueueFromPhone ? '' : 'none';
-					(currentCategoryWrapper || body).appendChild(urlRow);
-					return;
-				}
-				const row = document.createElement('label');
-				row.className = 'ytqm-setting-row';
-				const labelWrap = document.createElement('span');
-				labelWrap.className = 'ytqm-setting-label';
-				labelWrap.textContent = def.label;
-				if (def.beta) {
-					const badge = document.createElement('span');
-					badge.className = 'ytqm-beta-badge';
-					badge.textContent = 'beta';
-					labelWrap.appendChild(badge);
-				}
-				if (def.sub) {
-					const small = document.createElement('small');
-					small.textContent = def.sub;
-					labelWrap.appendChild(small);
-				}
-				let control;
-				if (def.type === 'number') {
-					control = document.createElement('input');
-					control.type = 'number';
-					control.min = '1';
-					control.max = '60';
-					control.step = '1';
-					control.value = Settings.get()[def.key];
-					control._ytqmSettingKey = def.key;
-					Object.assign(control.style, {
-						width: '52px',
-						background: 'rgba(255,255,255,0.08)',
-						border: '1px solid rgba(255,255,255,0.2)',
-						borderRadius: '6px',
-						color: '#fff',
-						padding: '4px 7px',
-						fontSize: '12px',
-						fontFamily: 'inherit',
-						textAlign: 'center'
-					});
-					control.addEventListener('change', () => {
-						const v = Math.max(1, Math.min(60, parseInt(control.value, 10) || 5));
-						control.value = v;
-						Settings.set(def.key, v);
-						log(`Setting changed: ${def.key} =`, v);
-						if (Player._playing) Player._registerMediaSession();
-					});
-				} else {
-					const toggle = document.createElement('span');
-					toggle.className = 'ytqm-toggle';
-					const input = document.createElement('input');
-					input.type = 'checkbox';
-					input.checked = Settings.get()[def.key];
-					input._ytqmSettingKey = def.key;
-					input.addEventListener('change', () => {
-						Settings.set(def.key, input.checked);
-						log(`Setting changed: ${def.key} =`, input.checked);
-						UI.updateControls();
-						UI.updateRemotePauseBtn();
-						if (def.key === 'theaterMode') TheaterMode.init();
-						if (def.key === 'mediaSessionRefresh' && Player._playing) Player._registerMediaSession();
-						if (def.key === 'hideNativeButtons') NativeButtonHider.apply();
-						if (def.key === 'hideShorts') ShortsHider.apply();
-						if (def.key === 'hideInterruptionsBanner') InterruptionsBannerHider.apply();
-						if (def.key === 'panelBlur') UI._applyPanelBlur();
-						if (def.key === 'enqueueFromPhone') {
-							input.checked ? PhonePoller.start() : PhonePoller.stop();
-							if (phoneUrlRow) phoneUrlRow.style.display = input.checked ? '' : 'none';
-						}
-					});
-					const track = document.createElement('span');
-					track.className = 'ytqm-toggle-track';
-					const thumb = document.createElement('span');
-					thumb.className = 'ytqm-toggle-thumb';
-					toggle.append(input, track, thumb);
-					control = toggle;
-				}
-				row.append(labelWrap, control);
-				(currentCategoryWrapper || body).appendChild(row);
+						urlRow.append(urlLabel, urlInput);
+						phoneUrlRow = urlRow;
+						urlRow.style.display = Settings.get().enqueueFromPhone ? '' : 'none';
+						panel.appendChild(urlRow);
+						return;
+					}
+
+					const row = document.createElement('label');
+					row.className = 'ytqm-setting-row';
+					const labelWrap = document.createElement('span');
+					labelWrap.className = 'ytqm-setting-label';
+					labelWrap.textContent = def.label;
+					if (def.beta) {
+						const badge = document.createElement('span');
+						badge.className = 'ytqm-beta-badge';
+						badge.textContent = 'beta';
+						labelWrap.appendChild(badge);
+					}
+					if (def.sub) {
+						const small = document.createElement('small');
+						small.textContent = def.sub;
+						labelWrap.appendChild(small);
+					}
+					let control;
+					if (def.type === 'number') {
+						control = document.createElement('input');
+						control.type = 'number';
+						control.min = '1';
+						control.max = '60';
+						control.step = '1';
+						control.value = Settings.get()[def.key];
+						control._ytqmSettingKey = def.key;
+						Object.assign(control.style, {
+							width: '52px',
+							background: 'rgba(255,255,255,0.08)',
+							border: '1px solid rgba(255,255,255,0.2)',
+							borderRadius: '6px',
+							color: '#fff',
+							padding: '4px 7px',
+							fontSize: '12px',
+							fontFamily: 'inherit',
+							textAlign: 'center'
+						});
+						control.addEventListener('change', () => {
+							const v = Math.max(1, Math.min(60, parseInt(control.value, 10) || 5));
+							control.value = v;
+							Settings.set(def.key, v);
+							log(`Setting changed: ${def.key} =`, v);
+							if (Player._playing) Player._registerMediaSession();
+						});
+					} else {
+						const toggle = document.createElement('span');
+						toggle.className = 'ytqm-toggle';
+						const input = document.createElement('input');
+						input.type = 'checkbox';
+						input.checked = Settings.get()[def.key];
+						input._ytqmSettingKey = def.key;
+						input.addEventListener('change', () => {
+							Settings.set(def.key, input.checked);
+							log(`Setting changed: ${def.key} =`, input.checked);
+							UI.updateControls();
+							UI.updateRemotePauseBtn();
+							if (def.key === 'theaterMode') TheaterMode.init();
+							if (def.key === 'mediaSessionRefresh' && Player._playing) Player._registerMediaSession();
+							if (def.key === 'hideNativeButtons') NativeButtonHider.apply();
+							if (def.key === 'hideShorts') ShortsHider.apply();
+							if (def.key === 'hideInterruptionsBanner') InterruptionsBannerHider.apply();
+							if (def.key === 'panelBlur') UI._applyPanelBlur();
+							if (def.key === 'dockedControls') UI._applyDockMode();
+							if (def.key === 'enqueueFromPhone') {
+								input.checked ? PhonePoller.start() : PhonePoller.stop();
+								if (phoneUrlRow) phoneUrlRow.style.display = input.checked ? '' : 'none';
+							}
+						});
+						const track = document.createElement('span');
+						track.className = 'ytqm-toggle-track';
+						const thumb = document.createElement('span');
+						thumb.className = 'ytqm-toggle-thumb';
+						toggle.append(input, track, thumb);
+						control = toggle;
+					}
+					row.append(labelWrap, control);
+					panel.appendChild(row);
+				});
 			});
 
 			// ── Import / Export section ────────────────────────────────────────
@@ -3554,7 +3873,7 @@
 			ioSection.append(ioTitle, ioRow, ioStatus);
 			const content = document.createElement('div');
 			content.id = 'ytqm-settings-content';
-			content.append(body, ioSection);
+			content.append(sidebar, body, ioSection);
 			modal.append(header, content);
 			this.settingsOverlay.appendChild(modal);
 			this.shadow.appendChild(this.settingsOverlay);
@@ -3670,8 +3989,15 @@
 				// The storage event does NOT fire in the same tab that wrote it,
 				// so _onPauseStorageChange() would never run here.
 				if (Player._playing) {
+					// An explicit click on our resume button is a deliberate
+					// user request to play, even if the video was most recently
+					// paused via YouTube's own controls (which sets _userPaused
+					// to stop cross-tab remote-pause syncing from fighting a
+					// manual pause). Clear it here so this button reliably
+					// resumes playback regardless of how it was paused.
+					Player._userPaused = false;
 					const video = document.querySelector('video');
-					if (video && video.paused && !video.ended && !Player._userPaused) {
+					if (video && video.paused && !video.ended) {
 						video.play().catch(() => Player._clickPlayButton());
 					}
 				}
@@ -4201,6 +4527,7 @@
 		if (Page.isWatchPage()) TheaterMode.init();
 		ThumbnailInjector.syncAllButtons();
 		SelectorHealth.scheduleCheck();
+		UI._applyDockMode();
 	}
 
 	window.addEventListener('popstate', () => {
