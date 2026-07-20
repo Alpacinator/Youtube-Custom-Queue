@@ -928,6 +928,9 @@
 				this._waitForVideoAndPlay();
 			} else {
 				Navigator.goTo(first.url);
+				// Same reasoning as advance()/previous(): don't rely solely on
+				// yt-navigate-finish to arm the attach poll/timeout.
+				this._waitForVideoAndPlay();
 			}
 		},
 
@@ -1614,8 +1617,27 @@
 			// next entry in the queue without it ever being played.
 			this._clearEndPoll();
 			UI.refreshPanel();
-			if (next) Navigator.goTo(next.url);
-			else this.stop();
+			if (next) {
+				Navigator.goTo(next.url);
+				// Don't rely solely on the global yt-navigate-finish listener to
+				// eventually call _waitForVideoAndPlay() for us. That event is
+				// NOT guaranteed to fire for every navigation path (see the
+				// Navigator module's comments on how unreliable YouTube's own
+				// nav events are) - and when it doesn't fire, nothing else ever
+				// arms _waitForVideoAndPlay()'s poll/timeout logic for this
+				// advance, so _advancing stays true forever and every later
+				// skip/previous silently no-ops. Calling it directly here
+				// guarantees a timeout-bounded resolution regardless of
+				// whether the browser-level event ever arrives. It's safe to
+				// call even if yt-navigate-finish ALSO fires later:
+				// _waitForVideoAndPlay() clears/re-arms its own timers each
+				// call, and once _onVideoReady has already resolved this
+				// navigation it's a harmless no-op (attach-poll would find
+				// the same already-attached video and return early).
+				this._waitForVideoAndPlay();
+			} else {
+				this.stop();
+			}
 		},
 
 		skip() {
@@ -1706,10 +1728,12 @@
 			Navigator.goTo(dest);
 
 			// Make sure the player attaches once the SPA navigation lands.
-			// yt-navigate-finish would normally take care of this, but we set
-			// _playing=true defensively so the attach poll fires for the case
-			// where Player wasn't already in the playing state.
+			// yt-navigate-finish is NOT guaranteed to fire for every
+			// navigation path, so don't rely on it alone (same reasoning as
+			// advance()/previous()/start()). start() covers this when we
+			// weren't already playing; otherwise arm it directly here.
 			if (!this._playing) this.start();
+			else this._waitForVideoAndPlay();
 		},
 
 		previous() {
@@ -1733,6 +1757,11 @@
 			this._navigatingToPrev = true;
 			UI.refreshPanel();
 			Navigator.goTo(prev.url);
+			// Same reasoning as in advance(): don't wait on yt-navigate-finish
+			// alone to arm the attach poll/timeout. Without this, a "previous"
+			// navigation that the event never fires for leaves
+			// _navigatingToPrev stuck true forever.
+			this._waitForVideoAndPlay();
 		},
 
 		_registerMediaSession() {
